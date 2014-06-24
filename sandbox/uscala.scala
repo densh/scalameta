@@ -86,55 +86,37 @@ object parse extends StandardTokenParsers {
   def program = rep(stmt)
 
   def as[T](parser: Parser[T])(s: String): ParseResult[T] = phrase(parser)(new lexical.Scanner(new CharSequenceReader(s)))
-  //def apply(s: String): ParseResult[List[Stmt]] = as(program)(s)
+  def apply(s: String): ParseResult[List[Stmt]] = as(program)(s)
 }
 
-object mscala extends App {
-  println(parse.as(parse.typ)("{}"))
-  println(parse.as(parse.typ)("{ val x: {} }"))
-  println(parse.as(parse.typ)("{ val x: {} val y: {} }"))
-
-  val pterm = (s: String) => println(parse.as(parse.term)(s))
-  pterm("x")
-  pterm("x: {}")
-  pterm("(x: {}) => x")
-  pterm("{}")
-  pterm("new {}")
-  pterm("{ x }")
-  pterm("new { x }")
-  pterm("new { val x: {} = {} }")
-  pterm("(x)")
-  pterm("x.y")
-  pterm("(x: {}).z")
-  pterm("{ val x: {} = {} x }")
-  pterm("{ import foo.bar.{baz} baz }")
-  pterm("{ import foo.bar.{baz=>bip} bip }")
-  pterm("{ import foo.bar.{baz=>_} foo }")
-  pterm("{ import foo.bar.{_} x }")
-}
-
-/*
 object typecheck {
   def apply(stats: List[Stmt]): List[Stmt] = ???
 }
 
 object expand {
-  def apply(stats: List[Stmt])(implicit env: Env = Map.empty): List[Stmt] = stats
+  type Env = Map[Name, Term => Term]
+
+  def stats(stats: List[Stmt])(implicit env: Env = Map.empty): List[Stmt] = stats
   def apply(t: Term)(implicit env: Env = Map.empty): Term = t
 }
 
 object eval {
   type Env = Map[Name, Term]
 
-  def apply(stats: List[Stmt])(implicit env: Env = Map.empty): List[Stmt] = stats match {
+  def stats(stats: List[Stmt])(implicit env: Env = Map.empty): List[Stmt] = stats match {
     case Nil => Nil
-    case (v @ Val(name, body)) :: rest =>
+    case (v @ Val(name, tpt, body)) :: rest =>
       val ebody = eval(body)
-      Val(name, ebody) :: eval(rest)(env + (name -> ebody))
-    case Import(sel @ Select(_, name)) :: rest =>
-      eval(rest)(env + (name -> sel))
+      Val(name, tpt, ebody) :: eval.stats(rest)(env + (name -> ebody))
+    case Import(t, sels) :: rest =>
+      val bindings = sels.map {
+        case n: Name                 => n -> Select(t, n)
+        case Import.Rename(from, to) => to -> Select(t, from)
+        case _                       => ???
+      }
+      eval.stats(rest)(env ++ bindings)
     case (t: Term) :: rest =>
-      eval(t) :: eval(rest)
+      eval(t) :: eval.stats(rest)
   }
 
   def apply(term: Term)(implicit env: Env = Map.empty): Term = {
@@ -142,11 +124,11 @@ object eval {
       case Apply(fun, value) =>
         val efun = eval(fun)
         efun match {
-          case Func(name, body) => eval(body)(env + (name -> value))
-          case _                => abort("can't apply $value to $efun")
+          case Func(name, _, body) => eval(body)(env + (name -> value))
+          case _                   => abort("can't apply $value to $efun")
         }
       case Block(stats) =>
-        eval(stats) match {
+        eval.stats(stats) match {
           case Nil               => Block(Nil)
           case _ :+ (last: Term) => last
           case _                 => Block(Nil)
@@ -156,14 +138,15 @@ object eval {
         equal match {
           case New(stats) =>
             stats collectFirst {
-              case Val(vname, value) if vname == name => value
+              case Val(vname, _, value) if vname == name => value
             } getOrElse {
               abort(s"object $equal doesn't have field $name")
             }
           case other =>
             abort(s"can't select $name from $equal")
         }
-      case New(stats) => New(eval(stats).filter(_.isInstanceOf[Val]))
+      case Ascribe(t, _) => eval(t)
+      case New(stats) => New(eval.stats(stats).filter(_.isInstanceOf[Val]))
       case func: Func => func
       case name: Name => eval(env.get(name).getOrElse(abort(s"can't resolve name $name")))
     }
@@ -172,13 +155,8 @@ object eval {
   }
 }
 
-object mscala extends App {
-  def run(s: String) = eval(expand(typecheck(parse(s))))
-
-  run("""
-    val x: {} = {}
-  """)
+object Test extends App {
+  eval.stats(parse("""
+    (new { val x: {} = {} }).x
+  """).get)
 }
-*/
-
-
