@@ -143,7 +143,8 @@ object build extends Build {
   ) settings (
     sharedSettings: _*
   ) settings (
-    scalaSource in Compile <<= (baseDirectory in Compile)(base => base)
+    scalaSource in Compile <<= (baseDirectory in Compile)(base => base),
+    libraryDependencies += "org.scala-lang.modules" %% "scala-parser-combinators" % "1.0.1"
   ) dependsOn (scalameta)
 
   lazy val tests = Project(
