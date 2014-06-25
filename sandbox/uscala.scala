@@ -6,43 +6,33 @@ import scala.util.parsing.input.CharSequenceReader
 import scala.language.higherKinds
 
 trait TreeTemplate {
-  type CTree
-  type CType
-  type CSel
-  type CStmt
-  type CTerm
-  type CName
+  type C[T <: Tree]
 
   sealed trait Tree { override def toString = showTree(this).toString }
     sealed trait Type extends Tree
     object Type {
-      final case class Func(from: CType, to: CType) extends Type
-      final case class Rec(fields: List[(CName, CType)]) extends Type
+      final case class Func(from: C[Type], to: C[Type]) extends Type
+      final case class Rec(fields: List[(C[Name], C[Type])]) extends Type
     }
     sealed trait Stmt extends Tree
-      final case class Val(name: CName, typ: CType, value: CTerm) extends Stmt
-      final case class Import(t: CTerm, sels: List[CSel]) extends Stmt
+      final case class Val(name: C[Name], typ: C[Type], value: C[Term]) extends Stmt
+      final case class Import(t: C[Term], sels: List[C[Import.Sel]]) extends Stmt
       object Import {
         sealed trait Sel extends Tree
-        final case class Rename(from: CName, to: CName) extends Sel
-        final case class Exclude(name: CName) extends Sel
+        final case class Rename(from: C[Name], to: C[Name]) extends Sel
+        final case class Exclude(name: C[Name]) extends Sel
         final case object Wildcard extends Sel
       }
       sealed trait Term extends Stmt
-        final case class Ascribe(value: CTerm, typ: CType) extends Term
-        final case class Func(name: CName, typ: CType, value: CTerm) extends Term
-        final case class Block(stats: List[CStmt]) extends Term
-        final case class New(stats: List[CStmt]) extends Term
-        final case class Apply(fun: CTerm, arg: CTerm) extends Term
+        final case class Ascribe(value: C[Term], typ: C[Type]) extends Term
+        final case class Func(name: C[Name], typ: C[Type], value: C[Term]) extends Term
+        final case class Block(stats: List[C[Stmt]]) extends Term
+        final case class New(stats: List[C[Stmt]]) extends Term
+        final case class Apply(fun: C[Term], arg: C[Term]) extends Term
         final case class Name(value: String) extends Term with Import.Sel
-        final case class Select(prefix: CTerm, name: CName) extends Term
+        final case class Select(prefix: C[Term], name: C[Name]) extends Term
 
-  implicit def showCTree[T <: CTree]: Show[CTree]
-  implicit def showCType[T <: CType]: Show[CType]
-  implicit def showCSel[T <: CSel]: Show[CSel]
-  implicit def showCStmt[T <: CStmt]: Show[CStmt]
-  implicit def showCTerm[T <: CTerm]: Show[CTerm]
-  implicit def showCName[T <: CName]: Show[CName]
+  implicit def showC[T <: Tree]: Show[C[T]]
   implicit def showTree[T <: Tree]: Show[T] = Show {
     case Type.Func(from, to)    => s(from, " => ", to)
     case Type.Rec(Nil)          => s("{}")
@@ -65,34 +55,19 @@ trait TreeTemplate {
 }
 
 object Untyped extends TreeTemplate {
-  type CTree = Tree
-  type CType= Type
-  type CSel = Import.Sel
-  type CStmt = Stmt
-  type CTerm = Term
-  type CName = Name
-  implicit def showCTree[T <: CTree]: Show[CTree] = showTree
-  implicit def showCType[T <: CType]: Show[CType] = showTree
-  implicit def showCSel [T <: CSel ]: Show[CSel ] = showTree
-  implicit def showCStmt[T <: CStmt]: Show[CStmt] = showTree
-  implicit def showCTerm[T <: CTerm]: Show[CTerm] = showTree
-  implicit def showCName[T <: CName]: Show[CName] = showTree
+  type C[T <: Tree] = T
+  implicit def showC[T <: Tree]: Show[C[T]] = showTree
 }
 
 object Typed extends TreeTemplate {
-  final case class Of(term: Term, tpe: Type)
-  type CTree = Tree
-  type CType= Type
-  type CSel = Import.Sel
-  type CStmt = Stmt
-  type CTerm = Of
-  type CName = Name
-  implicit def showCTree[T <: CTree]: Show[CTree] = showTree
-  implicit def showCType[T <: CType]: Show[CType] = showTree
-  implicit def showCSel [T <: CSel ]: Show[CSel ] = showTree
-  implicit def showCStmt[T <: CStmt]: Show[CStmt] = showTree
-  implicit def showCTerm[T <: CTerm]: Show[CTerm] = Show { ct => s("<", ct.term, "> :: ", ct.tpe) }
-  implicit def showCName[T <: CName]: Show[CName] = showTree
+  sealed trait C[+T <: Tree] { def tree: T; override def toString = showC[T](this).toString }
+  final case class Of[T <: Term](tree: T, tpe: No[Type]) extends C[T]
+  final case class No[T <: Tree](tree: T) extends C[T]
+
+  implicit def showC[T <: Tree]: Show[C[T]] = Show {
+    case Of(term, tpe) => s("<", term, "> :: ", tpe.tree)
+    case No(tree)      => s(tree)
+  }
 }
 
 object abort { def apply(msg: String): Nothing = throw new Exception(msg) }
@@ -138,55 +113,93 @@ object parse extends StandardTokenParsers {
 }
 
 object typecheck {
-  import uscala.{Untyped => U, Typed => T}
-  import T.Of
+  import uscala.{Untyped => U}
+  import Typed._
 
-  type Env = Map[String, T.Type]
+  type Env = Map[Name, No[Type]]
 
-  implicit class Subtype(me: T.Type) {
-    def `<:`(other: T.Type) = (me, other) match {
-      //case (T.Func(s1, s2), T.Fun(tdd1, t2)) => t1 `<:` s1  && t1 <: t2
+  implicit class Subtype(me: C[Type]) {
+    def `<:`(other: C[Type]): Boolean = (me.tree, other.tree) match {
       case (a, b) if a == b => true
+      case (Type.Func(s1, s2), Type.Func(t1, t2)) => t1 `<:` s1 && s2 `<:` t2
+      case (Type.Rec(fields1), Type.Rec(fields2)) =>
+        fields1.forall { case (n, t) =>
+          fields2.collectFirst { case (n2, t2) if n == n2 => t2 }.map(_ `<:` t).getOrElse(false)
+        }
     }
   }
 
-  def sels(sels: List[U.Import.Sel])(implicit env: Env = Map.empty): List[T.Import.Sel] = ???
+  def sels(sels: List[U.Import.Sel])(implicit env: Env = Map.empty): List[Import.Sel] = ???
 
-  def stats(stats: List[U.Stmt])(implicit env: Env = Map.empty): List[T.Stmt] = ???
+  def stats(ss: List[U.Stmt])(implicit env: Env = Map.empty): (Env, List[C[Stmt]]) = ss match {
+    case Nil => (Map.empty, Nil)
+    case U.Val(n: U.Name, tpt, body) :: rest =>
+      val tn = Name(n.value)
+      val ttpt = typ(tpt)
+      val bind= tn -> ttpt
+      val tbody = term(body)(env + bind)
+      val (tenv, trest) = stats(rest)(env + bind)
+      (tenv + bind, No(Val(No(tn), ttpt, tbody)) :: trest)
+  }
 
-  def term(tree: U.Term)(implicit env: Env = Map.empty): Of = tree match {
-    case U.Name(n) =>
-      if (!env.contains(n)) abort(s"$n is not in scope")
-      else Of(T.Name(n), env(n))
+  def term(tree: U.Term)(implicit env: Env = Map.empty): Of[Term] = tree match {
+    case n: U.Name =>
+      val tn = Name(n.value)
+      if (!env.contains(tn)) abort(s"$tn is not in scope")
+      else Of(tn, env(tn))
 
-    case U.Func(U.Name(x), tpt, body) =>
-      val ttpt: T.Type = typ(tpt)
-      val tbody: Of = term(body)(env + (x -> ttpt))
-      Of(T.Func(T.Name(x), ttpt, tbody), T.Type.Func(ttpt, tbody.tpe))
+    case U.Func(x, tpt, body) =>
+      val tx = Name(x.value)
+      val ttpt = typ(tpt)
+      val tbody = term(body)(env + (tx -> ttpt))
+      Of(Func(No(tx), ttpt, tbody), No(Type.Func(ttpt, tbody.tpe)))
 
     case U.Apply(f, arg) =>
       val tf = term(f)
       val targ = term(arg)
-      tf.tpe match {
-        case tpe @ T.Type.Func(from, to) =>
-          if (from `<:` targ.tpe)
-            Of(T.Apply(tf, targ), to)
+      tf.tpe.tree match {
+        case tpe @ Type.Func(from, to: No[Type]) =>
+          if (targ.tpe `<:` from)
+            Of(Apply(tf, targ), to)
           else
             abort(s"function expected $from but got ${targ.tpe}")
         case _ =>
           abort(s"one can only apply to function values")
       }
 
-    case U.Block(Nil) =>
-      Of(T.Block(Nil), T.Type.Rec(Nil))
+    case U.Block(blockstats) =>
+      val (_, tstats) = stats(blockstats)
+      val tpe: No[Type] = tstats match {
+        case _ :+ (t: Of[_]) => t.tpe
+        case _               => No(Type.Rec(Nil))
+      }
+      Of(Block(tstats), tpe)
+
+    case U.New(newstats) =>
+      val (tenv, tstats) = stats(newstats)
+      val tpe = No[Type](Type.Rec(tenv.map { case (n, t) => (No(Name(n.value)), t) }.toList))
+      Of(New(tstats), tpe)
+
+    case U.Select(obj, name: U.Name) =>
+      val tobj = term(obj)
+      val tsel = tobj.tpe.tree match {
+        case Type.Rec(fields) =>
+          fields.collectFirst { case field @ (n, t: No[Type]) if n.tree.value == name.value => t }.getOrElse {
+            abort(s"object doesn't have a field $name")
+          }
+        case _ =>
+          abort(s"can't select from non-object value")
+      }
+      Of(Select(tobj, No(Name(name.value))), tsel)
   }
 
-  def typ(tree: U.Type)(implicit env: Env = Map.empty): T.Type = tree match {
-    case U.Type.Func(from, to) => T.Type.Func(typ(from), typ(to))
+  def typ(tree: U.Type)(implicit env: Env = Map.empty): No[Type] = tree match {
+    case U.Type.Func(from, to) => No(Type.Func(typ(from), typ(to)))
     // TODO: validate that there no repetion a-la { val x: {} val x: {} }
-    case U.Type.Rec(fields) => T.Type.Rec(fields.map { case (U.Name(n), t) => (T.Name(n), typ(t)) })
+    case U.Type.Rec(fields) => No(Type.Rec(fields.map { case (U.Name(n), t) => (No(Name(n)), typ(t)) }))
   }
 }
+
 /*
 object expand {
   type Env = Map[Name, Term => Term]
@@ -294,12 +307,12 @@ object eval {
 }*/
 
 object Test extends App {
-  val parsed = parse("((x: {}) => x)({})")
+  val parsed = parse("((x: {}) => x)(new { val x: {} = {} })")
   println(parsed)
   //eval.stats(parsed.get)
   //val exp = expand.nstats(parsed.get)
   //println(s"expanded: $exp")
   //eval.stats(exp)
   val typechecked = typecheck.term(parsed.get.head.asInstanceOf[Untyped.Term])
-  println(s"typechecked: ${Typed.showCTerm(typechecked)}")
+  println(s"typechecked: $typechecked")
 }
