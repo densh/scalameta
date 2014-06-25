@@ -1,38 +1,48 @@
 package uscala
 
-import org.scalareflect.show.Show, Show.{ sequence => s, repeat => r, indent => i, newline => n }
+import org.scalameta.show.Show, Show.{ sequence => s, repeat => r, indent => i, newline => n }
 import scala.util.parsing.combinator.syntactical.StandardTokenParsers
 import scala.util.parsing.input.CharSequenceReader
 import scala.language.higherKinds
 
 trait TreeTemplate {
-  type Ctx[T <: Tree]
+  type CTree
+  type CType
+  type CSel
+  type CStmt
+  type CTerm
+  type CName
 
   sealed trait Tree { override def toString = showTree(this).toString }
     sealed trait Type extends Tree
     object Type {
-      final case class Func(from: Ctx[Type], to: Ctx[Type]) extends Type
-      final case class Rec(fields: List[(Ctx[Name], Ctx[Type])]) extends Type
+      final case class Func(from: CType, to: CType) extends Type
+      final case class Rec(fields: List[(CName, CType)]) extends Type
     }
     sealed trait Stmt extends Tree
-      final case class Val(name: Ctx[Name], typ: Ctx[Type], value: Ctx[Term]) extends Stmt
-      final case class Import(t: Ctx[Term], sels: List[Ctx[Import.Sel]]) extends Stmt
+      final case class Val(name: CName, typ: CType, value: CTerm) extends Stmt
+      final case class Import(t: CTerm, sels: List[CSel]) extends Stmt
       object Import {
         sealed trait Sel extends Tree
-        final case class Rename(from: Ctx[Name], to: Ctx[Name]) extends Sel
-        final case class Exclude(name: Ctx[Name]) extends Sel
+        final case class Rename(from: CName, to: CName) extends Sel
+        final case class Exclude(name: CName) extends Sel
         final case object Wildcard extends Sel
       }
       sealed trait Term extends Stmt
-        final case class Ascribe(value: Ctx[Term], typ: Ctx[Type]) extends Term
-        final case class Func(name: Ctx[Name], typ: Ctx[Type], value: Ctx[Term]) extends Term
-        final case class Block(stats: List[Ctx[Stmt]]) extends Term
-        final case class New(stats: List[Ctx[Stmt]]) extends Term
-        final case class Apply(fun: Ctx[Term], arg: Ctx[Term]) extends Term
+        final case class Ascribe(value: CTerm, typ: CType) extends Term
+        final case class Func(name: CName, typ: CType, value: CTerm) extends Term
+        final case class Block(stats: List[CStmt]) extends Term
+        final case class New(stats: List[CStmt]) extends Term
+        final case class Apply(fun: CTerm, arg: CTerm) extends Term
         final case class Name(value: String) extends Term with Import.Sel
-        final case class Select(prefix: Ctx[Term], name: Ctx[Name]) extends Term
+        final case class Select(prefix: CTerm, name: CName) extends Term
 
-  implicit def showCtx[T <: Tree]: Show[Ctx[T]]
+  implicit def showCTree[T <: CTree]: Show[CTree]
+  implicit def showCType[T <: CType]: Show[CType]
+  implicit def showCSel[T <: CSel]: Show[CSel]
+  implicit def showCStmt[T <: CStmt]: Show[CStmt]
+  implicit def showCTerm[T <: CTerm]: Show[CTerm]
+  implicit def showCName[T <: CName]: Show[CName]
   implicit def showTree[T <: Tree]: Show[T] = Show {
     case Type.Func(from, to)    => s(from, " => ", to)
     case Type.Rec(Nil)          => s("{}")
@@ -55,20 +65,40 @@ trait TreeTemplate {
 }
 
 object Untyped extends TreeTemplate {
-  type Ctx[T <: Tree] = T
-  implicit def showCtx[T <: Tree]: Show[Ctx[T]] = showTree
+  type CTree = Tree
+  type CType= Type
+  type CSel = Import.Sel
+  type CStmt = Stmt
+  type CTerm = Term
+  type CName = Name
+  implicit def showCTree[T <: CTree]: Show[CTree] = showTree
+  implicit def showCType[T <: CType]: Show[CType] = showTree
+  implicit def showCSel [T <: CSel ]: Show[CSel ] = showTree
+  implicit def showCStmt[T <: CStmt]: Show[CStmt] = showTree
+  implicit def showCTerm[T <: CTerm]: Show[CTerm] = showTree
+  implicit def showCName[T <: CName]: Show[CName] = showTree
 }
 
 object Typed extends TreeTemplate {
-  sealed trait Ctx[T <: Tree]
-  final case class `:`[T <: Tree](tree: T, typ: Type) extends Ctx[T]
-  final case class No[T <: Tree](tree: T) extends Ctx[T]
-  implicit def showCtx[T <: Tree]: Show[Ctx[T]] = Show { ctx => s(ctx.tree) }
+  final case class Of(term: Term, tpe: Type)
+  type CTree = Tree
+  type CType= Type
+  type CSel = Import.Sel
+  type CStmt = Stmt
+  type CTerm = Of
+  type CName = Name
+  implicit def showCTree[T <: CTree]: Show[CTree] = showTree
+  implicit def showCType[T <: CType]: Show[CType] = showTree
+  implicit def showCSel [T <: CSel ]: Show[CSel ] = showTree
+  implicit def showCStmt[T <: CStmt]: Show[CStmt] = showTree
+  implicit def showCTerm[T <: CTerm]: Show[CTerm] = Show { ct => s("<", ct.term, "> :: ", ct.tpe) }
+  implicit def showCName[T <: CName]: Show[CName] = showTree
 }
 
 object abort { def apply(msg: String): Nothing = throw new Exception(msg) }
 
 object parse extends StandardTokenParsers {
+  import Untyped._
 
   lexical.delimiters ++= List("(", ")", "{", "}", ":", "=>", ".", "=", ",", ";")
   lexical.reserved   ++= List("new", "val", "import", "macro", "_")
@@ -109,34 +139,54 @@ object parse extends StandardTokenParsers {
 
 object typecheck {
   import uscala.{Untyped => U, Typed => T}
-  import T.{Ctx, `:`, No}
+  import T.Of
 
-  type Env = Map[T.Name, T.Type]
+  type Env = Map[String, T.Type]
 
-  implicit class Subtype(t: T.Type) {
-    def `<:`(other: T.Type) = ???
+  implicit class Subtype(me: T.Type) {
+    def `<:`(other: T.Type) = (me, other) match {
+      //case (T.Func(s1, s2), T.Fun(tdd1, t2)) => t1 `<:` s1  && t1 <: t2
+      case (a, b) if a == b => true
+    }
   }
 
-  // TODO: validated sels
-  def sels(sels: List[U.Import.Sel])(implicit env: Env = Map.empty): List[Ctx[T.Sel]] = ???
+  def sels(sels: List[U.Import.Sel])(implicit env: Env = Map.empty): List[T.Import.Sel] = ???
 
-  def stats(stats: List[U.Stmt])(implicit env: Env = Map.empty): List[Ctx[T.Stmt]] = stats match {
-    case Nil => Nil
-    case U.Val(U.Name(n), tpt, body) :: rest =>
-      val tname = T.Name(n) `:` tpt
-      val ttpt  = typ(stats)
-      val tbody = term(body)(env + (tname -> ttpt))
-      // TODO: require tbody `<:` ttpt
-      No(T.Val(tname, ttpt, tbody)) :: stats(rest)
-    case Import(from, sels) :: rest =>
-      val tfrom = term(from)
-      val tsels
-      No(T.Import(tfrom, tsels)) :: stats(rest)
+  def stats(stats: List[U.Stmt])(implicit env: Env = Map.empty): List[T.Stmt] = ???
+
+  def term(tree: U.Term)(implicit env: Env = Map.empty): Of = tree match {
+    case U.Name(n) =>
+      if (!env.contains(n)) abort(s"$n is not in scope")
+      else Of(T.Name(n), env(n))
+
+    case U.Func(U.Name(x), tpt, body) =>
+      val ttpt: T.Type = typ(tpt)
+      val tbody: Of = term(body)(env + (x -> ttpt))
+      Of(T.Func(T.Name(x), ttpt, tbody), T.Type.Func(ttpt, tbody.tpe))
+
+    case U.Apply(f, arg) =>
+      val tf = term(f)
+      val targ = term(arg)
+      tf.tpe match {
+        case tpe @ T.Type.Func(from, to) =>
+          if (from `<:` targ.tpe)
+            Of(T.Apply(tf, targ), to)
+          else
+            abort(s"function expected $from but got ${targ.tpe}")
+        case _ =>
+          abort(s"one can only apply to function values")
+      }
+
+    case U.Block(Nil) =>
+      Of(T.Block(Nil), T.Type.Rec(Nil))
   }
 
-  def term(term: U.Term)(implicit env: Env = Map.empty): Ctx[T.Term] = ???
+  def typ(tree: U.Type)(implicit env: Env = Map.empty): T.Type = tree match {
+    case U.Type.Func(from, to) => T.Type.Func(typ(from), typ(to))
+    // TODO: validate that there no repetion a-la { val x: {} val x: {} }
+    case U.Type.Rec(fields) => T.Type.Rec(fields.map { case (U.Name(n), t) => (T.Name(n), typ(t)) })
+  }
 }
-
 /*
 object expand {
   type Env = Map[Name, Term => Term]
@@ -241,16 +291,15 @@ object eval {
     println(s"eval($term) = $res")
     res
   }
-}
+}*/
 
 object Test extends App {
-  val parsed = parse("""{
-    val f: {} => {} = (x: {}) => f(x)
-    f({})
-  }""")
+  val parsed = parse("((x: {}) => x)({})")
   println(parsed)
   //eval.stats(parsed.get)
-  val exp = expand.nstats(parsed.get)
-  println(s"expanded: $exp")
-  eval.stats(exp)
+  //val exp = expand.nstats(parsed.get)
+  //println(s"expanded: $exp")
+  //eval.stats(exp)
+  val typechecked = typecheck.term(parsed.get.head.asInstanceOf[Untyped.Term])
+  println(s"typechecked: ${Typed.showCTerm(typechecked)}")
 }
