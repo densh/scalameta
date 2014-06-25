@@ -15,7 +15,6 @@ trait TreeTemplate {
   def emptyTypeMeta: TypeMeta
 
   sealed trait Tree { override def toString = showTree(this).toString }
-    case class Name(value: String) extends Tree with Import.Sel
     case class Bind(name: Name, typ: Type, meta: BindMeta = emptyBindMeta) extends Tree
     sealed trait Type extends Tree { def meta: TypeMeta }
     object Type {
@@ -37,8 +36,8 @@ trait TreeTemplate {
         case class Block(stats: List[Stmt], meta: TermMeta = emptyTermMeta) extends Term
         case class New(stats: List[Stmt], meta: TermMeta = emptyTermMeta) extends Term
         case class Apply(fun: Term, arg: Term, meta: TermMeta = emptyTermMeta) extends Term
+        case class Name(value: String, meta: TermMeta = emptyTermMeta) extends Term with Import.Sel
         case class Select(prefix: Term, name: Name, meta: TermMeta = emptyTermMeta) extends Term
-        case class Ident(name: Name, meta: TermMeta = emptyTermMeta) extends Term
 
   implicit def showTree[T <: Tree]: Show[T] = Show {
     case Type.Func(from, to, _) => s(from, " => ", to)
@@ -55,8 +54,7 @@ trait TreeTemplate {
     case Block(stats, _)        => s("{ ", r(stats.map(i(_)), " "), n("}"))
     case New(Nil, _)            => s("new {}")
     case New(stats, _)          => s("new { ", r(stats.map(i(_)), "; "), n("}"))
-    case Name(value)            => s(value)
-    case Ident(name, _)         => s(name)
+    case Name(value, _)         => s(value)
     case Select(pre, name, _)   => s(pre, ".", name)
     case Apply(f, arg, _)       => s(f, "(", arg, ")")
     case Bind(n, t, _)          => s(n, ": ", t)
@@ -79,12 +77,12 @@ object Typed extends TreeTemplate {
   type TypeMeta = Null
 
   def emptyBindMeta: BindMeta = null
-  def emptyTermMeta: TermMeta = abort("typed terms must contain a type")
+  def emptyTermMeta: TermMeta = null
   def emptyTypeMeta: TypeMeta = null
 
   override implicit def showTree[T <: Tree]: Show[T] = Show {
-    case t: Term => s("<", super.showTree(t), "> :: ", t.meta)
-    case t       => super.showTree(t)
+    case t: Term if t.meta != null => s("<", super.showTree(t), "> :: ", t.meta)
+    case t                         => super.showTree(t)
   }
 }
 
@@ -97,15 +95,15 @@ object parse extends StandardTokenParsers {
   lexical.reserved   ++= List("new", "val", "import", "macro", "_")
 
   def name:   Parser[Name]  = ident                                ^^ { s => Name(s) }
-  def id:     Parser[Ident] = name                                 ^^ { n => Ident(n) }
   def block:  Parser[Block] = "{" ~> rep(stmt) <~ "}"              ^^ { stats => Block(stats) }
   def `new`:  Parser[New]   = "new" ~> "{" ~> rep(stmt) <~ "}"     ^^ { stats => New(stats) }
   def func:   Parser[Func]  = ("(" ~> name ~ (":" ~> typ) <~ ")") ~ ("=>" ~> term) ^^ { case x ~ t ~ b => Func(Bind(x, t), b) }
   def parens: Parser[Term]  = "(" ~> term <~ ")"
-  def term1:  Parser[Term]  = id | block | `new` | func | parens
+  def term1:  Parser[Term]  = name | block | `new` | func | parens
   def term2:  Parser[Term]  = term1 ~ opt("." ~> name)             ^^ { case x ~ y => (x /: y)(Select(_, _)) }
   def term3:  Parser[Term]  = term2 ~ opt("(" ~> term <~ ")")      ^^ { case x ~ y => (x /: y)(Apply(_, _)) }
   def term:   Parser[Term]  = term3 ~ opt(":" ~> typ)              ^^ { case x ~ t => (x /: t)(Ascribe(_, _)) }
+
 
   def nameOrWildcard: Parser[Name => Import.Sel] = (name ^^ ((y: Name) => (x: Name) => Import.Rename(y, x))) |
                                                    ("_" ^^^ ((x: Name) => Import.Exclude(x)))
@@ -151,7 +149,6 @@ object typecheck {
 
   def stats(ss: List[U.Stmt])(implicit env: Env = Map.empty): (Env, List[Stmt]) = ss match {
     case Nil => (Map.empty, Nil)
-
     case U.Val(U.Bind(n: U.Name, tpt, _), body) :: rest =>
       val tn = Name(n.value)
       val ttpt = typ(tpt)
@@ -159,13 +156,11 @@ object typecheck {
       val tbody = term(body)(env + bind)
       val (tenv, trest) = stats(rest)(env + bind)
       (tenv + bind, Val(Bind(tn, ttpt), tbody) :: trest)
-
     case U.Import(t, sels) :: rest =>
       val tt = term(t)
       val sels = ???
       val (tenv, trest) = stats(rest)
       (tenv, Import(tt, sels) :: trest)
-
     case (t: U.Term) :: rest =>
       val tt = term(t)
       val (tenv, trest) = stats(rest)
@@ -173,9 +168,9 @@ object typecheck {
   }
 
   def term(tree: U.Term)(implicit env: Env = Map.empty): Term = tree match {
-    case U.Ident(n: U.Name, _)=>
+    case n: U.Name =>
       if (!env.contains(n.value)) abort(s"$n is not in scope")
-      else Ident(Name(n.value), env(n.value))
+      else Name(n.value, env(n.value))
 
     case U.Func(U.Bind(x, tpt, _), body, _) =>
       val tx = Name(x.value)
@@ -228,7 +223,7 @@ object typecheck {
   def typ(tree: U.Type)(implicit env: Env = Map.empty): Type = tree match {
     case U.Type.Func(from, to, _) => Type.Func(typ(from), typ(to))
     // TODO: validate that there no repetion a-la { val x: {} val x: {} }
-    case U.Type.Rec(fields, _) => Type.Rec(fields.map { case U.Bind(U.Name(n), t, _) => Bind(Name(n), typ(t)) })
+    case U.Type.Rec(fields, _) => Type.Rec(fields.map { case U.Bind(U.Name(n, _), t, _) => Bind(Name(n), typ(t)) })
   }
 }
 
