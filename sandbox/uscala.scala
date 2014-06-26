@@ -10,7 +10,7 @@ final case class Lex(id: Int = 0, marks: Set[Int] = Set.empty)
 object Lex {
   val empty = Lex()
 
-  implicit def show[L <: Lex]: Show[L] = Show {
+  implicit val show: Show[Lex] = Show {
     case Lex(id, marks) =>
       val base = if (id != 0) s("#", id.toString) else s()
       marks.foldRight(base) { case (m, x) => s(x, "^", m.toString) }
