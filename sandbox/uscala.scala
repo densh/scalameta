@@ -351,72 +351,88 @@ object expand {
   }
 }
 
+sealed trait Value
+object Value {
+  case class Func(f: Value => Value) extends Value
+  case class Obj(fields: Map[String, Value]) extends Value
+  object Obj { val empty = Obj(Map.empty) }
+}
+
 object eval {
-  type Env = Map[Int, Term]
+  type Env = List[Map[Int, Value]]
 
   var steps = 0
   val limit = 100
 
-  def addb(env: Env, binding: (Name, Term)): Env = {
+  def empty = newstack(Nil)
+
+  def default(t: Type): Value = t match {
+    case Type.Func(from, to) => Value.Func(identity)
+    case Type.Rec(fields)    => Value.Obj(fields.map { b => b.name.value -> default(b.typ) }.toMap)
+  }
+
+  def addb(env: Env, binding: (Name, Value)): Env = {
     val (n, v) = binding
     assert(n.lex.id != 0)
     if(env.contains(n.lex.id)) println(s"!!!!!!! entered $n twice")
-    env + (n.lex.id -> v)
+    val head :: rest = env
+    (head + (n.lex.id -> v)) :: rest
   }
 
-  def addbs(env: Env, bindings: List[(Name, Term)]): Env = {
+  def addbs(env: Env, bindings: List[(Name, Value)]): Env = {
     var env1 = env
     bindings.foreach { b => env1 = addb(env1, b) }
     env1
   }
 
-  def stats(stats: List[Stmt])(implicit env: Env = Map.empty): List[Stmt] = stats match {
+  def newstack(env: Env): Env =
+    Map.empty[Int, Value] :: env
+
+  def lookup(n: Name)(implicit env: Env): Value =
+    env.collectFirst { case m if m.contains(n.lex.id) => m(n.lex.id) }.get
+
+  def stats(stats: List[Stmt])(implicit env: Env = empty): List[(String, Value)] = stats match {
     case Nil => Nil
     case v @ Val(Bind(name, tpt), body) :: rest =>
-      val ebody = eval(body)(addb(env, name -> body))
-      Val(Bind(name, tpt), ebody) :: eval.stats(rest)(addb(env, name -> ebody))
+      val ebody = eval(body)(addb(env, name -> default(tpt)))
+      (name.value -> ebody) :: eval.stats(rest)(addb(env, name -> ebody))
     case Import(t, sels) :: rest =>
+      val __ @ (et: Value.Obj) = eval(t)
       val bindings = sels.map {
-        case Sel.Rename(from, to) => to -> Select(t, from)
+        case Sel.Rename(from, to) => to -> et.fields(from.value)
         case _                    => abort("unreachable")
       }
       eval.stats(rest)(addbs(env, bindings))
     case (t: Term) :: rest =>
-      eval(t) :: eval.stats(rest)
+      ("" -> eval(t)) :: eval.stats(rest)
   }
 
-  def apply(term: Term)(implicit env: Env = Map.empty): Term = {
+  def apply(term: Term)(implicit env: Env = empty): Value = {
     steps += 1
     if (steps > limit) abort("step limit reached")
-    val res = term match {
+    val res: Value = term match {
       case Apply(fun, value, _) =>
         val efun = eval(fun)
+        val evalue = eval(value)
         efun match {
-          case Func(bind, body, _) => eval(body)(addb(env, bind.name -> value))
-          case _                   => abort("can't apply $value to $efun")
+          case Value.Func(f) => f(evalue)
+          case _             => abort("unreachable")
         }
       case Block(stats, _) =>
         eval.stats(stats) match {
-          case Nil               => Block(Nil)
-          case _ :+ (last: Term) => last
-          case _                 => Block(Nil)
+          case _ :+ (("", value)) => value
+          case _                  => Value.Obj.empty
         }
       case Select(qual, name, _) =>
         val equal = eval(qual)
         equal match {
-          case New(stats, _) =>
-            stats collectFirst {
-              case Val(Bind(vname, _), value) if vname.value == name.value => value
-            } getOrElse {
-              abort(s"object $equal doesn't have field $name")
-            }
-          case other =>
-            abort(s"can't select $name from $equal")
+          case obj: Value.Obj => obj.fields(name.value)
+          case other          => abort("unreachable")
         }
       case Ascribe(t, _, _) => eval(t)
-      case New(stats, _) => New(eval.stats(stats).filter(_.isInstanceOf[Val]))
-      case Ident(name, _) => eval(env.get(name.lex.id).getOrElse(abort(s"can't resolve name $name")))
-      case func: Func => func
+      case Ident(name, _) => lookup(name)
+      case New(stats, _) => Value.Obj(eval.stats(stats).filter { case (k, v) => k.nonEmpty }.toMap)
+      case Func(Bind(name, tpt), body, _) => Value.Func(v => eval(body)(addb(newstack(env), name -> v)))
     }
     //println(s"eval($term) = $res")
     res
@@ -425,15 +441,10 @@ object eval {
 
 object Test extends App {
   val parsed = parse("""{
-    val x: { val a: {} val b: {} } = new { val a: {} = {} val b: {} = {} }
-    import x.{_}
-    a
+    val xx: { val x: {} } = ((xx: {}) => new { val x: {} = xx })(new { val y: {} = {} } )
+    xx
   }""")
   println(parsed)
-  //eval.stats(parsed.get)
-  //val exp = expand.nstats(parsed.get)
-  //println(s"expanded: $exp")
-  //eval.stats(exp)
   val (_, tstats) = typecheck.stats(parsed.get)
   println(s"typechecked: $tstats")
   val estats = expand.stats(tstats)
