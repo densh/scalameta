@@ -5,121 +5,124 @@ import scala.util.parsing.combinator.syntactical.StandardTokenParsers
 import scala.util.parsing.input.CharSequenceReader
 import scala.language.higherKinds
 
-trait TreeTemplate {
-  type TermInfo
-  type NameInfo
 
-  def emptyTermInfo: TermInfo
-  def emptyNameInfo: NameInfo
+final case class Lex(id: Int = 0, marks: Set[Int] = Set.empty)
+object Lex {
+  val empty = Lex()
 
-  sealed trait Tree { override def toString = showTree(this).toString }
-    case class Bind(name: Name, typ: Type) extends Tree
-    sealed trait Type extends Tree
-    object Type {
-      case class Func(from: Type, to: Type) extends Type
-      case class Rec(fields: List[Bind]) extends Type
+  implicit def show[L <: Lex]: Show[L] = Show {
+    case Lex(id, marks) =>
+      val base = if (id != 0) s("#", id.toString) else s()
+      marks.foldRight(base) { case (m, x) => s(x, "^", m.toString) }
+  }
+}
+
+sealed trait Tree { override def toString = Tree.show(this).toString }
+object Tree {
+  case class Name(value: String, lex: Lex = Lex.empty) extends Sel
+  object Name { implicit val show: Show[Name] = Show { n => s(n.value, n.lex) } }
+
+  case class Bind(name: Name, typ: Type) extends Tree
+  object Bind { implicit val show: Show[Bind] = Show { b => s(b.name, ": ", b.typ) } }
+
+  sealed trait Type extends Tree
+  object Type {
+    case class Func(from: Type, to: Type) extends Type
+    case class Rec(fields: List[Bind]) extends Type
+
+    implicit def show[T <: Type]: Show[T] = Show {
+      case Type.Func(from, to)    => s(from, " => ", to)
+      case Type.Rec(Nil)          => s("{}")
+      case Type.Rec(fields)       => s("{ ", r(fields.map { b => s("val ", b) }, " "), " }")
     }
-    sealed trait Stmt extends Tree
-      case class Val(bind: Bind, value: Term) extends Stmt
-      case class Import(t: Term, sels: List[Import.Sel]) extends Stmt
-      object Import {
-        sealed trait Sel extends Tree
-        case class Rename(from: Name, to: Name) extends Sel
-        case class Exclude(name: Name) extends Sel
-        case object Wildcard extends Sel
+  }
+
+  sealed trait Stmt extends Tree
+  object Stmt {
+    case class Val(bind: Bind, value: Term) extends Stmt
+    case class Import(from: Term, sels: List[Sel]) extends Stmt
+
+    implicit val show: Show[Stmt] = Show {
+      case Val(bind, value)       => s("val ", bind, " = ", value)
+      case Import(from, sels)     => s("import ", from, ".{", r(sels, ", "), "}")
+      case t: Term                => s(t)
+    }
+  }
+
+  sealed trait Term extends Stmt { def tpe: Option[Type] }
+  object Term {
+    case class Ascribe(value: Term, typ: Type, tpe: Option[Type] = None) extends Term
+    case class Func(bind: Bind, value: Term, tpe: Option[Type] = None) extends Term
+    case class Block(stats: List[Stmt], tpe: Option[Type] = None) extends Term
+    case class New(stats: List[Stmt], tpe: Option[Type] = None) extends Term
+    case class Apply(fun: Term, arg: Term, tpe: Option[Type] = None) extends Term
+    case class Select(prefix: Term, name: Name, tpe: Option[Type] = None) extends Term
+    case class Ident(name: Name, tpe: Option[Type] = None) extends Term
+
+    implicit val show: Show[Term] = Show { t =>
+      val raw = t match {
+        case Ascribe(term, typ, _)  => s(term, ": ", typ)
+        case Func(bind, value, _)   => s("(", bind, ") => ", value)
+        case Block(Nil, _)          => s("{}")
+        case Block(stats, _)        => s("{ ", r(stats.map(i(_)), " "), n("}"))
+        case New(Nil, _)            => s("new {}")
+        case New(stats, _)          => s("new { ", r(stats.map(i(_))), n("}"))
+        case Apply(f, arg, _)       => s(f, "(", arg, ")")
+        case Select(pre, name, _)   => s(pre, ".", name)
+        case Ident(name, _)         => s(name)
       }
-      sealed trait Term extends Stmt { def tpe: TermInfo }
-        case class Ascribe(value: Term, typ: Type, tpe: TermInfo = emptyTermInfo) extends Term
-        case class Func(bind: Bind, value: Term, tpe: TermInfo = emptyTermInfo) extends Term
-        case class Block(stats: List[Stmt], tpe: TermInfo = emptyTermInfo) extends Term
-        case class New(stats: List[Stmt], tpe: TermInfo = emptyTermInfo) extends Term
-        case class Apply(fun: Term, arg: Term, tpe: TermInfo = emptyTermInfo) extends Term
-        case class Select(prefix: Term, name: Name, tpe: TermInfo = emptyTermInfo) extends Term
-        case class Name(value: String, tpe: TermInfo = emptyTermInfo,
-                        lex: NameInfo = emptyNameInfo) extends Term with Import.Sel
+      t.tpe.map { tpe => s("<", raw, "> :: ", tpe) }.getOrElse(raw)
+    }
+  }
 
-  implicit def showTree[T <: Tree]: Show[T] = Show {
-    case Type.Func(from, to)    => s(from, " => ", to)
-    case Type.Rec(Nil)          => s("{}")
-    case Type.Rec(fields)       => s("{ ", r(fields.map { b => s("val ", b) }, " "), " }")
-    case Val(bind, value)       => s("val ", bind, " = ", value)
-    case Import(from, sels)     => s("import ", from, ".{", r(sels, ", "), "}")
-    case Import.Rename(fr, to)  => s(fr, " => ", to)
-    case Import.Exclude(n)      => s(n, " => _")
-    case Import.Wildcard        => s("_")
-    case Ascribe(term, typ, _)  => s(term, ": ", typ)
-    case Func(bind, value, _)   => s("(", bind, ") => ", value)
-    case Block(Nil, _)          => s("{}")
-    case Block(stats, _)        => s("{ ", r(stats.map(i(_)), " "), n("}"))
-    case New(Nil, _)            => s("new {}")
-    case New(stats, _)          => s("new { ", r(stats.map(i(_))), n("}"))
-    case n: Name                => s(n.value)
-    case Select(pre, name, _)   => s(pre, ".", name)
-    case Apply(f, arg, _)       => s(f, "(", arg, ")")
-    case Bind(n, t)             => s(n, ": ", t)
+  sealed trait Sel extends Tree
+  object Sel {
+    case class Rename(from: Name, to: Name) extends Sel
+    case class Exclude(name: Name) extends Sel
+    case object Wildcard extends Sel
+
+    implicit val show: Show[Sel] = Show {
+      case n: Name         => Tree.show(n)
+      case Rename(fr, to)  => s(fr, " => ", to)
+      case Exclude(n)      => s(n, " => _")
+      case Wildcard        => s("_")
+    }
+  }
+
+  implicit val show: Show[Tree] = Show {
+    case t: Type => s(t)
+    case t: Bind => s(t)
+    case t: Type => s(t)
+    case t: Stmt => s(t)
+    case t: Name => s(t)
   }
 }
-
-object Untyped extends TreeTemplate {
-  type TermInfo = Null
-  type NameInfo = Null
-  def emptyTermInfo: TermInfo = null
-  def emptyNameInfo: NameInfo = null
-}
-
-object Typed extends TreeTemplate {
-  type TermInfo = Type
-  type NameInfo = Null
-  def emptyTermInfo: TermInfo = null
-  def emptyNameInfo: NameInfo = null
-
-  override implicit def showTree[T <: Tree]: Show[T] = Show {
-    case t: Term if t.tpe != null => s("<", super.showTree(t), "> :: ", t.tpe)
-    case t                         => super.showTree(t)
-  }
-}
-
-object Expanded extends TreeTemplate {
-  case class Lex(id: Int)
-
-  type TermInfo = Type
-  type NameInfo = Lex
-  def emptyTermInfo: TermInfo = null
-  def emptyNameInfo: NameInfo = null
-
-  override implicit def showTree[T <: Tree]: Show[T] = Show {
-    case t: Name                  => s(super.showTree(t),
-                                       if (t.lex != null) s("#", t.lex.id.toString) else s(),
-                                       if (t.tpe != null) s(" :: ", t.tpe) else s())
-    case t: Term if t.tpe != null => s("<", super.showTree(t), "> :: ", t.tpe)
-    case t                        => super.showTree(t)
-  }
-}
+import Tree._, Stmt._, Term._
 
 object abort { def apply(msg: String): Nothing = throw new Exception(msg) }
 
 object parse extends StandardTokenParsers {
-  import Untyped._
 
   lexical.delimiters ++= List("(", ")", "{", "}", ":", "=>", ".", "=", ",", ";")
   lexical.reserved   ++= List("new", "val", "import", "macro", "_")
 
   def name:   Parser[Name]  = ident                                ^^ { s => Name(s) }
+  def id:     Parser[Ident] = name                                 ^^ { n => Ident(n) }
   def block:  Parser[Block] = "{" ~> rep(stmt) <~ "}"              ^^ { stats => Block(stats) }
   def `new`:  Parser[New]   = "new" ~> "{" ~> rep(stmt) <~ "}"     ^^ { stats => New(stats) }
   def func:   Parser[Func]  = ("(" ~> name ~ (":" ~> typ) <~ ")") ~ ("=>" ~> term) ^^ { case x ~ t ~ b => Func(Bind(x, t), b) }
   def parens: Parser[Term]  = "(" ~> term <~ ")"
-  def term1:  Parser[Term]  = name | block | `new` | func | parens
+  def term1:  Parser[Term]  = id | block | `new` | func | parens
   def term2:  Parser[Term]  = term1 ~ opt("." ~> name)             ^^ { case x ~ y => (x /: y)(Select(_, _)) }
   def term3:  Parser[Term]  = term2 ~ opt("(" ~> term <~ ")")      ^^ { case x ~ y => (x /: y)(Apply(_, _)) }
   def term:   Parser[Term]  = term3 ~ opt(":" ~> typ)              ^^ { case x ~ t => (x /: t)(Ascribe(_, _)) }
 
 
-  def nameOrWildcard: Parser[Name => Import.Sel] = (name ^^ ((y: Name) => (x: Name) => Import.Rename(y, x))) |
-                                                   ("_" ^^^ ((x: Name) => Import.Exclude(x)))
-  def sel: Parser[Import.Sel]  = (name ~ opt("=>" ~> nameOrWildcard)  ^^
-                                  { case x ~ fopt => fopt.map(f => f(x)).getOrElse(x) }) |
-                                 ("_" ^^^ Import.Wildcard)
+  def nameOrWildcard: Parser[Name => Sel] = (name ^^ ((y: Name) => (x: Name) => Sel.Rename(y, x))) |
+                                            ("_" ^^^ ((x: Name) => Sel.Exclude(x)))
+  def sel: Parser[Sel]  = (name ~ opt("=>" ~> nameOrWildcard)  ^^
+                           { case x ~ fopt => fopt.map(f => f(x)).getOrElse(x) }) |
+                          ("_" ^^^ Sel.Wildcard)
   def `import`: Parser[Import] = "import" ~> term ~ ("." ~> "{" ~> repsep(sel, ",") <~ "}") ^^ { case from ~ sels => Import(from, sels) }
 
   def `val`:    Parser[Val]    = ("val" ~> name) ~ (":" ~> typ) ~ ("=" ~> term) ^^ { case x ~ t ~ b => Val(Bind(x, t), b) }
@@ -139,9 +142,6 @@ object parse extends StandardTokenParsers {
 }
 
 object typecheck {
-  import uscala.{Untyped => U}
-  import Typed._
-
   type Env = Map[String, Type]
 
   implicit class Subtype(me: Type) {
@@ -155,17 +155,17 @@ object typecheck {
     }
   }
 
-  def imp(t: Term, sels: List[Import.Sel])(implicit env: Env = Map.empty): List[(String, Type)] = {
-    import Import._
+  def imp(from: Term, sels: List[Sel])(implicit env: Env = Map.empty): List[(String, Type)] = {
+    import Sel._
     val (wildcards, nonwild) = sels.span(_ == Wildcard)
     val (exclusions, nonexcluded) = nonwild.span(_.isInstanceOf[Exclude])
-    val members: Map[Name, Type] = t.tpe match {
+    val members: Map[Name, Type] = from.tpe.get match {
       case Type.Func(_, _)  => Map.empty
       case Type.Rec(fields) => fields.map { case Bind(n, t) => (n, t) }.toMap
     }
     def getmember(n: Name): Type = {
       val opt: Option[Type] = members.get(n)
-      opt.getOrElse { abort(s"can't import $n as it's not defined in $t") }
+      opt.getOrElse { abort(s"can't import $n as it's not defined in $from") }
     }
     wildcards match {
       case Nil =>
@@ -189,75 +189,65 @@ object typecheck {
     }
   }
 
-  def stats(ss: List[U.Stmt])(implicit env: Env = Map.empty): (Env, List[Stmt]) = ss match {
+  def stats(ss: List[Stmt])(implicit env: Env = Map.empty): (Env, List[Stmt]) = ss match {
     case Nil => (Map.empty, Nil)
-    case U.Val(U.Bind(n: U.Name, tpt), body) :: rest =>
+    case Val(Bind(n: Name, tpt), body) :: rest =>
       val tn = Name(n.value)
       val ttpt = typ(tpt)
       val bind= tn.value -> ttpt
       val tbody = term(body)(env + bind)
       val (tenv, trest) = stats(rest)(env + bind)
       (tenv + bind, Val(Bind(tn, ttpt), tbody) :: trest)
-    case U.Import(t, sels) :: rest =>
-      val tt = term(t)
+    case Import(from, sels) :: rest =>
+      val tfrom = term(from)
       // TODO: validate selectors
-      val tsels = this.sels(sels)
-      val binds = imp(tt, tsels)
+      val binds = imp(tfrom, sels)
       val (tenv, trest) = stats(rest)(env ++ binds)
-      (tenv, Import(tt, tsels) :: trest)
-    case (t: U.Term) :: rest =>
+      (tenv, Import(tfrom, sels) :: trest)
+    case (t: Term) :: rest =>
       val tt = term(t)
       val (tenv, trest) = stats(rest)
       (tenv, tt :: trest)
   }
 
-  def sels(sels: List[U.Import.Sel]): List[Import.Sel] = sels map {
-    case n: U.Name => Name(n.value)
-    case U.Import.Rename(from: U.Name, to: U.Name) => Import.Rename(Name(from.value), Name(to.value))
-    case U.Import.Exclude(n: U.Name) => Import.Exclude(Name(n.value))
-    case U.Import.Wildcard => Import.Wildcard
-  }
-
-  def term(tree: U.Term)(implicit env: Env = Map.empty): Term = tree match {
-    case n: U.Name =>
+  def term(tree: Term)(implicit env: Env = Map.empty): Term = tree match {
+    case Ident(n, _) =>
       if (!env.contains(n.value)) abort(s"$n is not in scope")
-      else Name(n.value, env(n.value))
+      else Ident(n, tpe = Some(env(n.value)))
 
-    case U.Func(U.Bind(x, tpt), body, _) =>
+    case Func(Bind(x, tpt), body, _) =>
       val tx = Name(x.value)
       val ttpt = typ(tpt)
       val tbody = term(body)(env + (tx.value -> ttpt))
-      Func(Bind(tx, ttpt), tbody, Type.Func(ttpt, tbody.tpe))
+      Func(Bind(tx, ttpt), tbody, tpe = Some(Type.Func(ttpt, tbody.tpe.get)))
 
-    case U.Apply(f, arg, _) =>
+    case Apply(f, arg, _) =>
       val tf = term(f)
       val targ = term(arg)
-      tf.tpe match {
+      tf.tpe.get match {
         case tpe @ Type.Func(from, to) =>
-          if (targ.tpe `<:` from)
-            Apply(tf, targ, to)
+          if (targ.tpe.get `<:` from)
+            Apply(tf, targ, tpe = Some(to))
           else
             abort(s"function expected $from but got ${targ.tpe}")
         case _ =>
           abort(s"one can only apply to function values")
       }
 
-    case U.Block(blockstats, _) =>
+    case Block(blockstats, _) =>
       val (_, tstats) = stats(blockstats)
-      val tpe: Type = tstats match {
+      Block(tstats, tpe = tstats match {
         case _ :+ (t: Term) => t.tpe
-        case _              => Type.Rec(Nil)
-      }
-      Block(tstats, tpe)
+        case _              => Some(Type.Rec(Nil))
+      })
 
-    case U.New(newstats, _) =>
+    case New(newstats, _) =>
       val (tenv, tstats) = stats(newstats)
-      val tpe = Type.Rec(tenv.map { case (n, t) => Bind(Name(n), t) }.toList)
-      New(tstats, tpe)
+      New(tstats, tpe = Some(Type.Rec(tenv.map { case (n, t) => Bind(Name(n), t) }.toList)))
 
-    case U.Select(obj, name: U.Name, _) =>
+    case Select(obj, name: Name, _) =>
       val tobj = term(obj)
-      val tsel = tobj.tpe match {
+      val tsel = tobj.tpe.get match {
         case Type.Rec(fields) =>
           fields.collectFirst { case field @ Bind(n, t) if n.value == name.value => t }.getOrElse {
             abort(s"object doesn't have a field $name")
@@ -265,48 +255,41 @@ object typecheck {
         case _ =>
           abort(s"can't select from non-object value")
       }
-      Select(tobj, Name(name.value), tsel)
+      Select(tobj, Name(name.value), tpe = Some(tsel))
 
-    case U.Ascribe(t, tpt, _) =>
+    case Ascribe(t, tpt, _) =>
       val tt = term(t)
       val ttpt = typ(tpt)
-      if (tt.tpe `<:` ttpt) Ascribe(tt, ttpt, ttpt)
+      if (tt.tpe.get `<:` ttpt) Ascribe(tt, ttpt, tpe = Some(ttpt))
       else abort("ascripted value isn't a proper supertype")
   }
 
-  def typ(tree: U.Type)(implicit env: Env = Map.empty): Type = tree match {
-    case U.Type.Func(from, to) => Type.Func(typ(from), typ(to))
+  def typ(tree: Type)(implicit env: Env = Map.empty): Type = tree match {
+    case Type.Func(from, to) => Type.Func(typ(from), typ(to))
     // TODO: validate that there no repetion a-la { val x: {} val x: {} }
-    case U.Type.Rec(fields) => Type.Rec(fields.map { case U.Bind(n: U.Name, t) => Bind(Name(n.value), typ(t)) })
+    case Type.Rec(fields) => Type.Rec(fields.map { case Bind(n: Name, t) => Bind(Name(n.value), typ(t)) })
   }
 }
 
 object expand {
-  import uscala.{Typed => T}
-  import Expanded._
-
   type Env = Map[String, Term => Term]
 
-  var i = 0
-
-  def rename(n: T.Name): Name = {
-    i += 1
-    val tpe = if (n.tpe == null) null else typ(n.tpe)
-    Name(n.value, tpe, lex = Lex(i))
+  var renameId = 0
+  def rename(n: Name): Name = {
+    renameId += 1
+    Name(n.value, lex = n.lex.copy(id = renameId))
   }
 
-  def rename1(n: Name): Name = {
-    i += 1
-    Name(n.value, n.tpe, lex = Lex(i))
-  }
+  var markId = 0
+  def mark(t: Tree): Tree = ???
 
-  def subs(k: String, x: Name): (String, Term => Term) = k -> { t => x.copy(tpe = t.tpe) }
+  def subs(k: String, x: Name): (String, Term => Term) = k -> { case Ident(n, tpe) => Ident(x, tpe) }
 
-  def imp(t: Term, sels: List[Import.Sel])(implicit env: Env = Map.empty): (List[Import.Rename], Env) = {
-    import Import._
+  def imp(from: Term, sels: List[Sel])(implicit env: Env = Map.empty): (List[Sel.Rename], Env) = {
+    import Sel._
     val (wildcards, nonwild) = sels.span(_ == Wildcard)
     val (exclusions, nonexcluded) = nonwild.span(_.isInstanceOf[Exclude])
-    val members: Map[Name, Type] = t.tpe match {
+    val members: Map[Name, Type] = from.tpe.get match {
       case Type.Func(_, _)  => Map.empty
       case Type.Rec(fields) => fields.map { case Bind(n, t) => (n, t) }.toMap
     }
@@ -329,66 +312,56 @@ object expand {
     val transforms = new scala.collection.mutable.ListBuffer[(String, Term => Term)]
     (original.map {
       case Rename(from, to) =>
-        val x = rename1(to)
+        val x = rename(to)
         transforms += subs(to.value, x)
         Rename(from, x)
     }, transforms.toMap)
   }
 
-  def stats(trees: List[T.Stmt])(implicit env: Env = Map.empty): List[Stmt] = trees match {
+  def stats(trees: List[Stmt])(implicit env: Env = Map.empty): List[Stmt] = trees match {
     case Nil                       => Nil
-    case (t: T.Term) :: rest       => term(t) :: stats(rest)
-    case T.Val(T.Bind(n, t), b) :: rest    =>
+    case (t: Term) :: rest       => term(t) :: stats(rest)
+    case Val(Bind(n, t), b) :: rest    =>
       val x = rename(n)
       val newenv = env + subs(n.value, x)
       Val(Bind(x, typ(t)), term(b)(newenv)) :: stats(rest)(newenv)
-    case T.Import(t, sels) :: rest =>
-      val et = term(t)
-      val esels = this.sels(sels)
-      val (renames, envupd) = imp(et, esels)
-      Import(et, renames) :: stats(rest)(env ++ envupd) // TODO: rename this guys too
+    case Import(from, sels) :: rest =>
+      val efrom = term(from)
+      val (esels, envupd) = imp(efrom, sels)
+      Import(efrom, esels) :: stats(rest)(env ++ envupd)
   }
 
-  def term(tree: T.Term)(implicit env: Env = Map.empty): Term = tree match {
-    case T.Apply(fun, arg, tpe)       => Apply(term(fun), term(arg), tpe = typ(tpe))
-    case T.Block(stats, tpe)          => Block(this.stats(stats), tpe = typ(tpe))
-    case T.Select(qual, name, tpe)    => Select(term(qual), Name(name.value), tpe = typ(tpe))
-    case T.Ascribe(v, t, tpe)         => Ascribe(term(v), typ(t), tpe = typ(tpe))
-    case T.New(stats, tpe)            => New(this.stats(stats), tpe = typ(tpe))
-    case T.Func(T.Bind(n, t), b, tpe) =>
+  def term(tree: Term)(implicit env: Env = Map.empty): Term = tree match {
+    case Apply(fun, arg, tpe)       => Apply(term(fun), term(arg), tpe = tpe.map(typ))
+    case Block(stats, tpe)          => Block(this.stats(stats), tpe = tpe.map(typ))
+    case Select(qual, name, tpe)    => Select(term(qual), Name(name.value), tpe = tpe.map(typ))
+    case Ascribe(v, t, tpe)         => Ascribe(term(v), typ(t), tpe = tpe.map(typ))
+    case New(stats, tpe)            => New(this.stats(stats), tpe = tpe.map(typ))
+    case Func(Bind(n, t), b, tpe) =>
       val x = rename(n)
-      Func(Bind(x, typ(t)), term(b)(env + subs(n.value, x)), tpe = typ(tpe))
-    case n: T.Name                  =>
-      env.get(n.value).map { f =>
-        val res = f(Name(n.value, tpe = typ(n.tpe)))
-        res
-      }.getOrElse(abort(s"panic, can't resolve $n"))
+      Func(Bind(x, typ(t)), term(b)(env + subs(n.value, x)), tpe = tpe.map(typ))
+    case Ident(n, tpe)              =>
+      val pre = Ident(n, tpe.map(typ))
+      env.get(n.value).map { f => f(pre) }.getOrElse(abort(s"panic, can't resolve $n"))
   }
 
-  def typ(tree: T.Type)(implicit env: Env = Map.empty): Type = tree match {
-    case T.Type.Func(from, to) => Type.Func(typ(from), typ(to))
-    case T.Type.Rec(fields)    => Type.Rec(fields.map { case T.Bind(n: T.Name, t) => Bind(Name(n.value), typ(t)) })
-  }
-
-  def sels(sels: List[T.Import.Sel]): List[Import.Sel] = sels map {
-    case n: T.Name => Name(n.value)
-    case T.Import.Rename(from: T.Name, to: T.Name) => Import.Rename(Name(from.value), Name(to.value))
-    case T.Import.Exclude(n: T.Name) => Import.Exclude(Name(n.value))
-    case T.Import.Wildcard => Import.Wildcard
+  def typ(tree: Type)(implicit env: Env = Map.empty): Type = tree match {
+    case Type.Func(from, to) => Type.Func(typ(from), typ(to))
+    case Type.Rec(fields)    => Type.Rec(fields.map { case Bind(n: Name, t) => Bind(Name(n.value), typ(t)) })
   }
 }
 
-/*
 object eval {
-  type Env = Map[Name, Term]
+  type Env = Map[Int, Term]
 
   var steps = 0
   val limit = 100
 
   def addb(env: Env, binding: (Name, Term)): Env = {
-    val (n, _) = binding
-    if(env.contains(n)) println(s"!!!!!!! entered $n twice")
-    env + binding
+    val (n, v) = binding
+    assert(n.lex.id != 0)
+    if(env.contains(n.lex.id)) println(s"!!!!!!! entered $n twice")
+    env + (n.lex.id -> v)
   }
 
   def addbs(env: Env, bindings: List[(Name, Term)]): Env = {
@@ -399,14 +372,13 @@ object eval {
 
   def stats(stats: List[Stmt])(implicit env: Env = Map.empty): List[Stmt] = stats match {
     case Nil => Nil
-    case (v @ Val(name, tpt, body)) :: rest =>
+    case v @ Val(Bind(name, tpt), body) :: rest =>
       val ebody = eval(body)(addb(env, name -> body))
-      Val(name, tpt, ebody) :: eval.stats(rest)(addb(env, name -> ebody))
+      Val(Bind(name, tpt), ebody) :: eval.stats(rest)(addb(env, name -> ebody))
     case Import(t, sels) :: rest =>
       val bindings = sels.map {
-        case n: Name                 => n -> Select(t, n)
-        case Import.Rename(from, to) => to -> Select(t, from)
-        case _                       => ???
+        case Sel.Rename(from, to) => to -> Select(t, from)
+        case _                    => abort("unreachable")
       }
       eval.stats(rest)(addbs(env, bindings))
     case (t: Term) :: rest =>
@@ -417,40 +389,39 @@ object eval {
     steps += 1
     if (steps > limit) abort("step limit reached")
     val res = term match {
-      case Apply(fun, value) =>
+      case Apply(fun, value, _) =>
         val efun = eval(fun)
         efun match {
-          case Func(name, _, body) => eval(body)(addb(env, name -> value))
+          case Func(bind, body, _) => eval(body)(addb(env, bind.name -> value))
           case _                   => abort("can't apply $value to $efun")
         }
-      case Block(stats) =>
+      case Block(stats, _) =>
         eval.stats(stats) match {
           case Nil               => Block(Nil)
           case _ :+ (last: Term) => last
           case _                 => Block(Nil)
         }
-      case Select(qual, name) =>
+      case Select(qual, name, _) =>
         val equal = eval(qual)
         equal match {
-          case New(stats) =>
+          case New(stats, _) =>
             stats collectFirst {
-              case Val(vname, _, value) if vname == name => value
+              case Val(Bind(vname, _), value) if vname.value == name.value => value
             } getOrElse {
               abort(s"object $equal doesn't have field $name")
             }
           case other =>
             abort(s"can't select $name from $equal")
         }
-      case Ascribe(t, _) => eval(t)
-      case New(stats) => New(eval.stats(stats).filter(_.isInstanceOf[Val]))
+      case Ascribe(t, _, _) => eval(t)
+      case New(stats, _) => New(eval.stats(stats).filter(_.isInstanceOf[Val]))
+      case Ident(name, _) => eval(env.get(name.lex.id).getOrElse(abort(s"can't resolve name $name")))
       case func: Func => func
-      case name: Name => eval(env.get(name).getOrElse(abort(s"can't resolve name $name")))
     }
-    println(s"eval($term) = $res")
+    //println(s"eval($term) = $res")
     res
   }
 }
-*/
 
 object Test extends App {
   val parsed = parse("""{
@@ -467,4 +438,6 @@ object Test extends App {
   println(s"typechecked: $tstats")
   val estats = expand.stats(tstats)
   println(s"expanded: $estats")
+  val value = eval.stats(estats)
+  println(s"value: $value")
 }
