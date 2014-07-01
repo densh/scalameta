@@ -5,6 +5,44 @@ import scala.util.parsing.combinator.syntactical.StandardTokenParsers
 import scala.util.parsing.input.CharSequenceReader
 import scala.language.higherKinds
 
+object util {
+  def abort(msg: String): Nothing = throw new Exception(msg)
+
+  def intersect[K, V](m1: Map[K, V], m2: Map[K, V])(resolve: (V, V) => V): Map[K, V] =
+    m1.toList.collect {
+      case (n, tpe) if m2.collectFirst { case (n2, _) if n == n2 => () }.nonEmpty =>
+        m2.collectFirst { case (n2, tpe2) => (n, resolve(tpe, tpe2)) }.get
+    }.toMap
+
+  def merge[K, V](m1: Map[K, V], m2: Map[K, V])(resolve: (V, V) => V): Map[K, V] = {
+    var m = m1
+    m2.keys.foreach { k =>
+      m = m1 + (k -> m1.get(k).map { v => resolve(v, m2(k)) }.getOrElse(m2(k)))
+    }
+    m
+  }
+
+  private val num2sup: Map[Int, String] = Map(
+    0 -> "⁰", 1 -> "¹", 2 -> "²", 3 -> "³", 4 -> "⁴",
+    5 -> "⁵", 6 -> "⁶", 7 -> "⁷", 8 -> "⁸", 9 -> "⁹"
+  )
+
+  private val num2subs: Map[Int, String] = Map(
+    0 -> "₀", 1 -> "₁", 2 -> "₂", 3 -> "₃", 4 -> "₄",
+    5 -> "₅", 6 -> "₆", 7 -> "₇", 8 -> "₈", 9 -> "₉"
+  )
+
+  def superscripted(i: Int): String =
+    if (i < 0) "₋" + superscripted(-i)
+    else if (i >= 10) subscripted(i%10) + subscripted(i/10)
+    else num2sup(i)
+
+  def subscripted(i: Int): String =
+    if (i < 0) "₋" + subscripted(-i)
+    else if (i >= 10) subscripted(i%10) + subscripted(i/10)
+    else num2subs(i)
+}
+import util._
 
 final case class Lex(id: Int = 0, marks: Set[Int] = Set.empty)
 object Lex {
@@ -12,8 +50,8 @@ object Lex {
 
   implicit val show: Show[Lex] = Show {
     case Lex(id, marks) =>
-      val base = if (id != 0) s("#", id.toString) else s()
-      marks.foldRight(base) { case (m, x) => s(x, "^", m.toString) }
+      val base = if (id != 0) s(subscripted(id)) else s()
+      marks.foldRight(base) { case (m, x) => s(x, superscripted(m)) }
   }
 }
 
@@ -24,15 +62,18 @@ object Tree {
 
   sealed trait Type extends Tree
   object Type {
+    sealed trait Builtin extends Type
     case class Func(from: Type, to: Type) extends Type
     case class Rec(fields: Map[String, Type]) extends Type
     object Rec { val empty = Rec(Map.empty) }
-    case object Bool extends Type
-    case object Nothing extends Type
+    case object Bool extends Builtin
+    case object Nothing extends Builtin
+    case object Tree extends Builtin
 
     implicit def show[T <: Type]: Show[T] = Show {
       case Type.Bool           => s("Bool")
       case Type.Nothing        => s("Nothing")
+      case Type.Tree           => s("Tree")
       case Type.Func(from, to) => s(from, " => ", to)
       case Type.Rec(fields)    =>
         if (fields.isEmpty) s("{}")
@@ -54,6 +95,7 @@ object Tree {
 
   sealed trait Term extends Stmt { def tpe: Option[Type] }
   object Term {
+    sealed trait Pretyped extends Term
     case class Ascribe(value: Term, typ: Type, tpe: Option[Type] = None) extends Term
     case class Func(name: Name, typ: Type, value: Term, tpe: Option[Type] = None) extends Term
     case class Block(stats: List[Stmt], tpe: Option[Type] = None) extends Term
@@ -62,8 +104,9 @@ object Tree {
     case class Select(prefix: Term, name: Name, tpe: Option[Type] = None) extends Term
     case class Ident(name: Name, tpe: Option[Type] = None) extends Term
     case class If(cond: Term, thenp: Term, elsep: Term, tpe: Option[Type] = None) extends Term
-    case object True extends Term { val tpe = Some(Type.Bool) }
-    case object False extends Term { val tpe = Some(Type.Bool) }
+    case object True extends Pretyped { val tpe = Some(Type.Bool) }
+    case object False extends Pretyped { val tpe = Some(Type.Bool) }
+    case class Quasiquote(tree: Term) extends Pretyped { val tpe = Some(Type.Tree) }
 
     implicit val show: Show[Term] = Show { t =>
       val raw = t match {
@@ -77,10 +120,11 @@ object Tree {
         case Select(pre, name, _)      => s(pre, ".", name)
         case Ident(name, _)            => s(name)
         case If(cond, thenp, elsep, _) => s("if ", cond, " then ", thenp, " else ", elsep)
+        case Quasiquote(t: Term)       => s("`", t, "'")
         case True                      => s("true")
         case False                     => s("false")
       }
-      t.tpe.map { tpe => s("<", raw, "> :: ", tpe, "") }.getOrElse(raw)
+      t.tpe.map { tpe => s("(", raw, " :: ", tpe, ")") }.getOrElse(raw)
     }
   }
 
@@ -107,12 +151,12 @@ object Tree {
 }
 import Tree._, Stmt._, Term._
 
-object abort { def apply(msg: String): Nothing = throw new Exception(msg) }
 
 object parse extends StandardTokenParsers {
 
-  lexical.delimiters ++= List("(", ")", "{", "}", ":", "=>", ".", "=", ",", ";")
-  lexical.reserved   ++= List("new", "val", "import", "macro", "_", "Bool", "true", "false", "if", "then", "else")
+  lexical.delimiters ++= List("(", ")", "{", "}", ":", "=>", ".", "=", ",", ";", "`", "'", "$")
+  lexical.reserved   ++= List("new", "val", "import", "macro", "_", "Bool", "Tree",
+                              "true", "false", "if", "then", "else")
 
   def name:   Parser[Name]  = ident                                ^^ { s => Name(s) }
   def id:     Parser[Ident] = name                                 ^^ { n => Ident(n) }
@@ -123,10 +167,12 @@ object parse extends StandardTokenParsers {
                                 case x ~ t ~ b => Func(x, t, b)
                               }
   def parens: Parser[Term]  = "(" ~> term <~ ")"
+  def qq:     Parser[Term]  = "`" ~> term <~ "'"                   ^^ { t => Quasiquote(t) }
+
   def `if`:   Parser[Term]  = ("if" ~> term) ~ ("then" ~> term) ~ ("else" ~> term) ^^ {
                                 case cond ~ thenp ~ elsep => If(cond, thenp, elsep)
                               }
-  def term1:  Parser[Term]  = `if` | bool | id | block | `new` | func | parens
+  def term1:  Parser[Term]  = `if` | bool | id | block | `new` | func | parens | qq
   def term2:  Parser[Term]  = term1 ~ opt("." ~> name)             ^^ { case x ~ y => (x /: y)(Select(_, _)) }
   def term3:  Parser[Term]  = term2 ~ opt("(" ~> term <~ ")")      ^^ { case x ~ y => (x /: y)(Apply(_, _)) }
   def term:   Parser[Term]  = term3 ~ opt(":" ~> typ)              ^^ { case x ~ t => (x /: t)(Ascribe(_, _)) }
@@ -141,11 +187,12 @@ object parse extends StandardTokenParsers {
   def `val`:    Parser[Val]    = ("val" ~> name) ~ (":" ~> typ) ~ ("=" ~> term) ^^ { case x ~ t ~ b => Val(x, t, b) }
   def stmt:     Parser[Stmt]   = `val` | `import` | term
 
-  def tbool: Parser[Type.Bool.type] = "Bool" ^^ { _ => Type.Bool }
-  def trec:  Parser[Type.Rec]  = "{" ~> repsep(name ~ (":" ~> typ), ",") <~ "}" ^^ {
+  def tbool: Parser[Type] = "Bool" ^^ { _ => Type.Bool }
+  def ttree: Parser[Type] = "Tree" ^^ { _ => Type.Tree }
+  def trec:  Parser[Type] = "{" ~> repsep(name ~ (":" ~> typ), ",") <~ "}" ^^ {
     fields => Type.Rec(fields.map { case a ~ b => (a.value, b) }.toMap)
   }
-  def typ:   Parser[Type]      = (tbool | trec) ~ rep("=>" ~> trec) ^^ {
+  def typ:   Parser[Type]      = (ttree | tbool | trec) ~ rep("=>" ~> trec) ^^ {
     case first ~ rest => rest.foldRight[Type](first)(Type.Func(_, _))
   }
 
@@ -169,20 +216,6 @@ object typecheck {
     }
   }
 
-  def intersect[K, V](m1: Map[K, V], m2: Map[K, V])(resolve: (V, V) => V): Map[K, V] =
-    m1.toList.collect {
-      case (n, tpe) if m2.collectFirst { case (n2, _) if n == n2 => () }.nonEmpty =>
-        m2.collectFirst { case (n2, tpe2) => (n, resolve(tpe, tpe2)) }.get
-    }.toMap
-
-  def merge[K, V](m1: Map[K, V], m2: Map[K, V])(resolve: (V, V) => V): Map[K, V] = {
-    var m = m1
-    m2.keys.foreach { k =>
-      m = m1 + (k -> m1.get(k).map { v => resolve(v, m2(k)) }.getOrElse(m2(k)))
-    }
-    m
-  }
-
   def lub(t1: Type, t2: Type): Type = (t1, t2) match {
     case (Type.Rec(fields1), Type.Rec(fields2)) => Type.Rec(intersect(fields1, fields2)(lub))
     case (Type.Bool, Type.Bool)                 => Type.Bool
@@ -199,7 +232,6 @@ object typecheck {
 
   def imp(from: Term, sels: List[Sel])(implicit env: Env = Map.empty): List[(String, (String, Type))] = {
     val (wildcards, nonwild) = sels.span(_ == Sel.Wildcard)
-    println(s"sels: $sels")
     val (exclusions, nonexcluded) = nonwild.span(_.isInstanceOf[Sel.Exclude])
     val members: Map[String, Type] = from.tpe.get match {
       case Type.Rec(members) => members
@@ -307,18 +339,19 @@ object typecheck {
       if (tt.tpe.get `<:` ttpt) Ascribe(tt, ttpt, tpe = Some(ttpt))
       else abort("ascripted value isn't a proper supertype")
 
-    case bool @ (True | False) => bool
-
     case If(cond, thenp, elsep, _) =>
       val tcond = term(cond)
       if (tcond.tpe.get != Type.Bool) abort(s"if condition must be Bool, not ${tcond.tpe}")
       val tthenp = term(thenp)
       val telsep = term(elsep)
       If(tcond, tthenp, telsep, tpe = Some(lub(tthenp.tpe.get, telsep.tpe.get)))
+
+    case pretpt: Pretyped =>
+      pretpt
   }
 
   def typ(tree: Type)(implicit env: Env = Map.empty): Type = tree match {
-    case Type.Bool | Type.Nothing => tree
+    case builtin: Type.Builtin    => builtin
     case Type.Func(from, to)      => Type.Func(typ(from), typ(to))
     // TODO: validate that there no repetion a-la { val x: {} val x: {} }
     case Type.Rec(fields)         => Type.Rec(fields.map { case (n, t) => (n, typ(t)) })
@@ -379,13 +412,14 @@ object expand {
       val pre = Ident(n, tpe.map(typ))
       env.get(n.value).map { f => f(pre) }.getOrElse(abort(s"panic, can't resolve $n"))
     case If(cond, thenp, elsep, tpe) => If(term(cond), term(thenp), term(elsep), tpe = tpe.map(typ))
+    case Quasiquote(t)           => Quasiquote(term(t))
     case bool @ (True | False)   => bool
   }
 
   def typ(tree: Type)(implicit env: Env = Map.empty): Type = tree match {
-    case Type.Bool | Type.Nothing => tree
-    case Type.Func(from, to)      => Type.Func(typ(from), typ(to))
-    case Type.Rec(fields)         => Type.Rec(fields.map { case (n, t) => (n, typ(t)) })
+    case builtin: Type.Builtin => builtin
+    case Type.Func(from, to)   => Type.Func(typ(from), typ(to))
+    case Type.Rec(fields)      => Type.Rec(fields.map { case (n, t) => (n, typ(t)) })
   }
 }
 
@@ -396,12 +430,14 @@ object Value {
   case class Func(f: Value => Value) extends Value
   case class Obj(fields: Map[String, Value]) extends Value
   object Obj { val empty = Obj(Map.empty) }
+  case class Tree(t: Term) extends Value
 
   implicit val show: Show[Value] = Show {
     case Value.Func(f)     => s(f.toString)
     case Value.Obj(fields) => s("{", r(fields.toList.map { case (n, v) => s(n, " = ", v.toString) }, ","), "}")
     case Value.True        => s("true")
     case Value.False       => s("false")
+    case Value.Tree(t)     => s("`", t, "'")
   }
 }
 
@@ -418,6 +454,7 @@ object eval {
     case Type.Rec(fields)    => Value.Obj(fields.map { case (n, t) => n -> default(t) }.toMap)
     case Type.Bool           => Value.False
     case Type.Nothing        => abort("unreachable")
+    case Type.Tree           => Value.Tree(Term.Block(Nil))
   }
 
   def addb(env: Env, binding: (Name, Value)): Env = {
@@ -485,6 +522,7 @@ object eval {
       case True => Value.True
       case False => Value.False
       case If(cond, thenp, elsep, _) => if (eval(cond) == Value.True) eval(thenp) else eval(elsep)
+      case Quasiquote(t) => Value.Tree(t)
     }
     //println(s"eval($term) = $res")
     res
@@ -493,19 +531,22 @@ object eval {
 
 object Test extends App {
   val parsed = parse("""
-    val xx: { y: Bool } = ((xx: Bool) => new { val y: Bool = xx })(false)
-    import xx.{y => x}
-    if x then (x: Bool) => x else (x: {}) => x
+    val y: Tree = `true'
+    val x: Tree = `if y then true else false'
   """)
   println(parsed)
+  println()
   val (_, tstats) = typecheck.stats(parsed.get)
-  println(s"typechecked: $tstats")
+  val ststats = tstats.map(_.toString).mkString("", "\n", "")
+  println(s"typechecked:\n$ststats\n")
   val estats = expand.stats(tstats)
-  println(s"expanded: $estats")
+  val sestats = estats.mkString("", "\n", "")
+  println(s"expanded:\n$sestats\n")
   val values = eval.stats(estats)
   println("evaluation:")
   values.foreach {
     case ("", v) => println(v)
     case (n, v)  => println(s"$n = $v")
   }
+  println()
 }
