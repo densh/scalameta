@@ -64,14 +64,15 @@ object Tree {
   object Type {
     sealed abstract class Builtin(val name: String) extends Type
     object Builtin { def unapply(b: Builtin): Some[String] = Some(b.name) }
+    case object Bool extends Builtin("Bool")
+    case object Int extends Builtin("Int")
+    case object Unit extends Builtin("Unit")
+    case object Tree extends Builtin("Tree")
     case class Func(from: Type, to: Type) extends Type
     case class Rec(fields: Map[String, Type]) extends Type
     object Rec { val empty = Rec(Map.empty) }
-    case object Bool extends Builtin("Bool")
+
     case object Nothing extends Builtin("Nothing")
-    case object Tree extends Builtin("Tree")
-    case object Int extends Builtin("Int")
-    case object Unit extends Builtin("Unit")
 
     implicit def show: Show[Type] = Show {
       case Type.Builtin(name)  => s(name)
@@ -503,7 +504,7 @@ object Value {
       case Value.Unit    => s("()")
       case Value.Bool(v) => if (v) s("true") else s("false")
       case Value.Int(v)  => s(v.toString)
-      case Value.Ptr(id) => s("#", id.toString, " @ ", store(id))
+      case Value.Ptr(id) => s("#", id.toString, if (id != 0) s(" @ ", store(id)) else s())
     }
   }
   case class Int(value: scala.Int) extends Stack
@@ -517,12 +518,12 @@ object Value {
   sealed trait Ref extends Value
   object Ref {
     implicit def show(implicit store: eval.Store): Show[Value.Ref] = Show {
-      case Value.Func(tag, _) => s("ƒ<", tag, ">")
-      case Value.Tree(t)      => s("`", Term.show(t), "'")
-      case Value.Obj(fields)  => s("{", r(fields.toList.map { case (n, v) => s(n, " = ", v) }, ", "), "}")
+      case Value.Func(_)     => s("ƒ")
+      case Value.Tree(t)     => s("`", Term.show(t), "'")
+      case Value.Obj(fields) => s("{", r(fields.toList.map { case (n, v) => s(n, " = ", v) }, ", "), "}")
     }
   }
-  case class Func(tag: String, f: eval.Res => eval.Res) extends Ref
+  case class Func(f: eval.Res => eval.Res) extends Ref
   case class Tree(t: Term) extends Ref
   case class Obj(fields: Map[String, Value.Stack]) extends Ref
   object Obj {
@@ -550,13 +551,13 @@ object predefined {
                                               EA: Extract[Value.Stack, A], EB: Extract[Value.Stack, B],
                                               CR: Convert[R, Value.Stack]): (Type, Value.Func) =
     Type.Func(A.tpe, Type.Func(B.tpe, R.tpe)) ->
-      Value.Func("binop outer", { case Res(EA(a), s1) =>
-        s1.alloc(Value.Func("binop inner", { case Res(EB(b), s2) => Res(CR(f(a, b)), s2) }))
-      })
+      Value.Func { case Res(EA(a), s1) =>
+        s1.alloc(Value.Func { case Res(EB(b), s2) => Res(CR(f(a, b)), s2) })
+      }
 
   def unop[A, R](f: A => R)(implicit A: Type.Tag[A], R: Type.Tag[R],
                                      EA: Extract[Value.Stack, A], CR: Convert[R, Value.Stack]): (Type, Value.Func) =
-    Type.Func(A.tpe, R.tpe) -> Value.Func("unop", { case Res(EA(a), s) => Res(CR(f(a)), s) })
+    Type.Func(A.tpe, R.tpe) -> Value.Func { case Res(EA(a), s) => Res(CR(f(a)), s) }
 
   val entries = List(
     "add" -> binop { (a: Int, b: Int) => a + b },
@@ -584,12 +585,18 @@ object predefined {
 }
 
 object eval {
+  def abort(msg: String)(implicit env: Env) = uscala.util.abort(s"$msg (${env.store})")
+
   final case class Store(objs: Map[Int, Value.Ref] = Map.empty, newid: Int = 1) {
     def alloc(v: Value.Ref): Res = {
       Res(Value.Ptr(newid), Store(objs + (newid -> v), newid + 1))
     }
-    def apply(id: Int): Value.Ref = objs(id)
+    def apply(id: Int): Value.Ref =  {
+      assert(id != 0)
+      objs(id)
+    }
     def put(id: Int, v: Value.Ref): Store = {
+      assert(id != 0)
       assert(objs.contains(id));
       Store(objs + (id -> v), newid)
     }
@@ -614,7 +621,7 @@ object eval {
     def push(): Env =
       Env(Map.empty[Int, Value.Stack] :: stack, store)
     def lookup(n: Name): Value.Stack =
-      stack.collectFirst { case m if m.contains(n.lex.id) => m(n.lex.id) }.getOrElse(abort(s"couldn't lookup $n"))
+      stack.collectFirst { case m if m.contains(n.lex.id) => m(n.lex.id) }.getOrElse(abort(s"couldn't lookup $n")(this))
   }
   object Env {
     def default = {
@@ -632,18 +639,15 @@ object eval {
     override def toString = Value.show(store).apply(value).toString
   }
 
-  var steps = 0
-  val limit = 1000000
-
   def default(t: Type): Value.Stack = t match {
     case Type.Rec(_) | Type.Func(_, _) | Type.Tree => Value.Ptr(0)
     case Type.Bool                                 => Value.False
     case Type.Int                                  => Value.Int(0)
     case Type.Unit                                 => Value.Unit
-    case Type.Nothing                              => abort("unreachable")
+    case Type.Nothing                              => abort("unreachable")(null)
   }
 
-  def stats(stats: List[Stmt], self: Option[Name] = None)(implicit env: Env = Env.default): List[(String, Res)] = {
+  def stats(stats: List[Stmt], self: Option[Name] = None)(implicit env: Env = Env.default): Res = {
     val (nenv, selfrefopt) = self.map { n =>
       val Res(ref: Value.Ptr, s) = env.store.alloc(Value.Obj(stats.collect {
         case Val(n, tpt, _) => n.value -> this.default(tpt)
@@ -651,8 +655,9 @@ object eval {
       (env.bind(n, ref).copy(store = s), Some(ref))
     }.getOrElse((env, None))
 
-    def loop(stats: List[Stmt])(implicit env: Env): List[(String, Res)] = stats match {
-      case Nil => Nil
+    def loop(stats: List[Stmt])(implicit env: Env): Res = stats match {
+      case Nil =>
+        Res(Value.Unit, env.store)
       case v @ Val(name, tpt, body) :: rest =>
         val res = eval(body)
         val store = selfrefopt.map { selfref =>
@@ -660,21 +665,24 @@ object eval {
             Value.Obj(fields + (name.value -> res.value))
           }
         }.getOrElse(res.store)
-        (name.value -> res) :: loop(rest)(env.copy(store = store))
+        val nenv = selfrefopt.map { _ => env }.getOrElse(env.bind(name, res.value)).copy(store = store)
+        loop(rest)(nenv)
       case (t: Term) :: rest =>
         val res = eval(t)
-        ("" -> res) :: loop(rest)(env.copy(store = res.store))
+        if (rest.isEmpty) res
+        else loop(rest)(env.copy(store = res.store))
       case (_: Import) :: rest =>
         abort("unreachable")
     }
 
-    loop(stats)(nenv)
+    val res = loop(stats)(nenv)
+    selfrefopt.map { selfref =>
+      Res(selfref, res.store)
+    }.getOrElse(res)
   }
 
   def apply(term: Term)(implicit env: Env = Env.default): Res = {
-    steps += 1
-    if (steps > limit) abort("step limit reached")
-    val res = term match {
+    term match {
       case Apply(fun, value, _) =>
         val Res(efun, s1) = eval(fun)
         val Res(evalue, s2) = eval(value)(env.copy(store = s1))
@@ -682,14 +690,9 @@ object eval {
           case Value.Ptr(0) =>
             abort("tried to invoke function that was null pointer")
           case Value.Ptr(id) =>
-            val Value.Func(_, f) = s2(id)
+            val Value.Func(f) = s2(id)
             f(Res(evalue, s2))
-          case _             => abort(s"unreachable ($efun, $s2)")
-        }
-      case Block(stats, _) =>
-        eval.stats(stats) match {
-          case _ :+ (("", res)) => res
-          case _                => Res(Value.Unit, env.store)
+          case _             => abort(s"unreachable")
         }
       case Select(qual, name, _) =>
         eval(qual) match {
@@ -703,13 +706,12 @@ object eval {
         }
       case Ident(name, _) =>
         Res(env.lookup(name), env.store)
+      case Block(stats, _) =>
+        eval.stats(stats)
       case New(nameopt, stats, _) =>
-        val estats = eval.stats(stats, self = nameopt)
-        val obj = Value.Obj(estats.filter { case (k, v) => k.nonEmpty }.map { case (k, Res(v, _)) => k -> v }.toMap)
-        val store = estats.lastOption.map { case (_, res) => res.store }.getOrElse(env.store)
-        store.alloc(obj)
+        eval.stats(stats, self = nameopt)
       case Func(name, tpt, body, _) =>
-        val fvalue = Value.Func(body.toString, r => eval(body)(env.copy(store = r.store).push().bind(name, r.value)))
+        val fvalue = Value.Func(r => eval(body)(env.copy(store = r.store).push().bind(name, r.value)))
         env.store.alloc(fvalue)
       case If(cond, thenp, elsep, _) =>
         val Res(econd, s) = eval(cond)
@@ -724,35 +726,35 @@ object eval {
       case Integer(v)       => Res(Value.Int(v), env.store)
       case Unit             => Res(Value.Unit, env.store)
     }
-    res
   }
 }
 
 object Test extends App {
   val parsed = parse("""
-    val fib: Int => Int = (x: Int) =>
-      if eq x 0 then 1
-      else if eq x 1 then 1
-      else mul x (fib (sub x 1));
-    fib(5)
+    val Fib: { fib: Int => Int } = new {
+      val fib: Int => Int = (x: Int) =>
+        if eq x 0 then 1
+        else if eq x 1 then 1
+        else mul x (fib (sub x 1))
+    };
+    import Fib.{_};
+    val fib5eq120: Bool = {
+      val tmp: Int = fib(5);
+      eq tmp 120
+    }
   """)
-
   println(parsed.map { p =>
     val pstats = p.mkString("", "\n", "")
     s"parsed:\n$pstats\n"
   }.getOrElse(parsed.toString))
+
   val root = Some(Name("_root_"))
   val (troot, tstats) = typecheck.stats(parsed.get, self = Some(root))
-  val ststats = tstats.map(_.toString).mkString("", "\n", "")
-  println(s"typechecked:\n$ststats\n")
+  println(s"typechecked:\n${tstats.map(_.toString).mkString("", "\n", "")}\n")
+
   val (rroot, estats) = expand.stats(tstats, self = Some((root, troot)))
-  val sestats = estats.mkString("", "\n", "")
-  println(s"expanded:\n$sestats\n")
-  val values = eval.stats(estats, self = rroot)
-  println("evaluation:")
-  values.foreach {
-    case ("", r) => println(r)
-    case (n,  r) => println(s"$n = $r")
-  }
-  println()
+  println(s"expanded:\n${estats.mkString("", "\n", "")}\n")
+
+  val res = eval.stats(estats, self = rroot)
+  println(s"evaluated: $res")
 }
