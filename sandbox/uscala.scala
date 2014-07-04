@@ -106,7 +106,7 @@ object Tree {
   object Term {
     sealed trait Pretyped extends Term
     case class Ascribe(value: Term, typ: Type, tpe: Option[Type] = None) extends Term
-    case class Func(name: Name, typ: Type, value: Term, tpe: Option[Type] = None) extends Term
+    case class Func(param: Option[(Name, Type)], value: Term, tpe: Option[Type] = None) extends Term
     case class Block(stats: List[Stmt], tpe: Option[Type] = None) extends Term
     case class New(self: Option[Name], stats: List[Stmt], tpe: Option[Type.Rec] = None) extends Term
     case class Apply(fun: Term, arg: Term, tpe: Option[Type] = None) extends Term
@@ -122,7 +122,7 @@ object Tree {
     implicit val show: Show[Term] = Show { t =>
       val raw = t match {
         case Ascribe(term, typ, _)     => s(term, ": ", typ)
-        case Func(x, t, value, _)      => s("(", x, ": ", t, ") => ", value)
+        case Func(param, value, _)     => s("(", param.map { case (x, t) => s(x, ": ", t) }.getOrElse(s()), ") => ", value)
         case Block(Nil, _)             => s("{}")
         case Block(stats, _)           => s("{ ", r(stats.map(i(_)), " "), n("}"))
         case New(selfopt, stats, _)    => s("new {",
@@ -193,8 +193,9 @@ object parse extends StandardTokenParsers {
   def `new`:  Parser[New]   = "new" ~> "{" ~> opt(name <~ "=>") ~ repsep(stmt, ";") <~ "}" ^^ {
                                 case selfopt ~ stats => New(selfopt, stats)
                               }
-  def func:   Parser[Func]  = ("(" ~> name ~ (":" ~> typ) <~ ")") ~ ("=>" ~> term) ^^ {
-                                case x ~ t ~ b => Func(x, t, b)
+  def func:   Parser[Func]  = ("(" ~> opt(name ~ (":" ~> typ)) <~ ")") ~ ("=>" ~> term) ^^ {
+                                case None ~ b        => Func(None, b)
+                                case Some(x ~ t) ~ b => Func(Some((x, t)), b)
                               }
   def parens: Parser[Term]  = "(" ~> opt(term) <~ ")"              ^^ { _.getOrElse(Term.Unit) }
   def qq:     Parser[Term]  = "`" ~> term <~ "'"                   ^^ { Quasiquote(_) }
@@ -338,11 +339,17 @@ object typecheck {
       if (!env.contains(n.value)) abort(s"$n is not in scope")
       else Ident(n, tpe = Some(env(n.value)))
 
-    case Func(x, tpt, body, _) =>
-      val tx = Name(x.value)
-      val ttpt = typ(tpt)
-      val tbody = term(body)(env + (tx.value -> ttpt))
-      Func(tx, ttpt, tbody, tpe = Some(Type.Func(ttpt, tbody.tpe.get)))
+    case Func(param, body, _) =>
+      val (tparam, ttpt, tbody) = param.map { case (x, tpt) =>
+        val tx = Name(x.value)
+        val ttpt = typ(tpt)
+        val tbody = term(body)(env + (tx.value -> ttpt))
+        (Some((tx, ttpt)), ttpt, tbody)
+      }.getOrElse {
+        val tbody = term(body)
+        (None, Type.Unit, tbody)
+      }
+      Func(tparam, tbody, tpe = Some(Type.Func(ttpt, tbody.tpe.get)))
 
     case Apply(f, arg, _) =>
       val tf = term(f)
@@ -484,9 +491,13 @@ object expand {
     case New(selfopt, stats, tpe) =>
       val (nself, nstats) = this.stats(stats, self = Some((selfopt, tpe.get)))
       New(nself, nstats, tpe)
-    case Func(n, t, b, tpe) =>
-      val x = rename(n)
-      Func(x, t, term(b)(env + (n.value -> Renaming(x))), tpe)
+    case Func(param, b, tpe) =>
+      param.map { case (n, t) =>
+        val x = rename(n)
+        Func(Some(x, t), term(b)(env + (n.value -> Renaming(x))), tpe)
+      }.getOrElse {
+        Func(None, term(b), tpe)
+      }
     case Ident(n, tpe) =>
       val pre = Ident(n, tpe)
       env.get(n.value).map { f => f(pre) }.getOrElse(abort(s"panic, can't resolve $n"))
@@ -710,8 +721,13 @@ object eval {
         eval.stats(stats)
       case New(nameopt, stats, _) =>
         eval.stats(stats, self = nameopt)
-      case Func(name, tpt, body, _) =>
-        val fvalue = Value.Func(r => eval(body)(env.copy(store = r.store).push().bind(name, r.value)))
+      case Func(param, body, _) =>
+        val fvalue =
+          param.map { case (name, tpt) =>
+            Value.Func(r => eval(body)(env.copy(store = r.store).push().bind(name, r.value)))
+          }.getOrElse {
+            Value.Func(r => eval(body)(env.copy(store = r.store).push()))
+          }
         env.store.alloc(fvalue)
       case If(cond, thenp, elsep, _) =>
         val Res(econd, s) = eval(cond)
@@ -738,10 +754,12 @@ object Test extends App {
         else mul x (fib (sub x 1))
     };
     import Fib.{_};
-    val fib5eq120: Bool = {
-      val tmp: Int = fib(5);
-      eq tmp 120
-    }
+    val fibeq: Int => Int => Bool = (x: Int) => (exp: Int) => {
+      val tmp: Int = fib(x);
+      eq tmp exp
+    };
+    val f: Unit => Int = () => 5;
+    val fib5eq120: Bool = fibeq (f ()) 120
   """)
   println(parsed.map { p =>
     val pstats = p.mkString("", "\n", "")
