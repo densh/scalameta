@@ -44,15 +44,10 @@ object util {
 }
 import util._
 
-final case class Lex(id: Int = 0, marks: Set[Int] = Set.empty)
+final case class Lex(id: Int = 0)
 object Lex {
   val empty = Lex()
-
-  implicit val show: Show[Lex] = Show {
-    case Lex(id, marks) =>
-      val base = if (id != 0) s(subscripted(id)) else s()
-      marks.foldRight(base) { case (m, x) => s(x, superscripted(m)) }
-  }
+  implicit val show: Show[Lex] = Show { lex => if (lex.id != 0) s(subscripted(lex.id)) else s() }
 }
 
 sealed trait Tree { override def toString = Tree.show(this).toString }
@@ -93,10 +88,12 @@ object Tree {
   sealed trait Stmt extends Tree
   object Stmt {
     case class Val(name: Name, typ: Type, value: Term) extends Stmt
+    case class Macro(name: Name, body: Term.Quasiquote, tenv: Option[typecheck.Env] = None) extends Stmt
     case class Import(from: Term, sels: List[Sel]) extends Stmt
 
     implicit val show: Show[Stmt] = Show {
       case Val(n, t, value)   => s("val ", n, ": ", t, " = ", value)
+      case Macro(n, q, _)     => s("macro ", n, " = ", (q: Term))
       case Import(from, sels) => s("import ", from, ".{", r(sels, ", "), "}")
       case t: Term            => s(t)
     }
@@ -113,7 +110,7 @@ object Tree {
     case class Select(prefix: Term, name: Name, tpe: Option[Type] = None) extends Term
     case class Ident(name: Name, tpe: Option[Type] = None) extends Term
     case class If(cond: Term, thenp: Term, elsep: Term, tpe: Option[Type] = None) extends Term
-    case class Quasiquote(tree: Term) extends Pretyped { val tpe = Some(Type.Tree) }
+    case class Quasiquote(term: Term) extends Pretyped { val tpe = Some(Type.Tree) }
     case class Integer(value: Int) extends Pretyped { val tpe = Some(Type.Int) }
     case object True extends Pretyped { val tpe = Some(Type.Bool) }
     case object False extends Pretyped { val tpe = Some(Type.Bool) }
@@ -124,10 +121,10 @@ object Tree {
         case Ascribe(term, typ, _)     => s(term, ": ", typ)
         case Func(param, value, _)     => s("(", param.map { case (x, t) => s(x, ": ", t) }.getOrElse(s()), ") => ", value)
         case Block(Nil, _)             => s("{}")
-        case Block(stats, _)           => s("{ ", r(stats.map(i(_)), " "), n("}"))
+        case Block(stats, _)           => s("{ ", r(stats.map(i(_)), ";"), n("}"))
         case New(selfopt, stats, _)    => s("new {",
                                             selfopt.map { self => s(" ", self, " => ") }.getOrElse(s()),
-                                            r(stats.map(i(_))),
+                                            r(stats.map(i(_)), ";"),
                                             if (stats.nonEmpty) n("}") else s("}"))
         case Apply(f, arg, _)          => s(f, "(", arg, ")")
         case Select(pre, name, _)      => s(pre, ".", name)
@@ -198,7 +195,7 @@ object parse extends StandardTokenParsers {
                                 case Some(x ~ t) ~ b => Func(Some((x, t)), b)
                               }
   def parens: Parser[Term]  = "(" ~> opt(term) <~ ")"              ^^ { _.getOrElse(Term.Unit) }
-  def qq:     Parser[Term]  = "`" ~> term <~ "'"                   ^^ { Quasiquote(_) }
+  def qq:     Parser[Term.Quasiquote]  = "`" ~> term <~ "'"        ^^ { Quasiquote(_) }
 
   def `if`:   Parser[Term]  = ("if" ~> term) ~ ("then" ~> term) ~ ("else" ~> term) ^^ {
                                 case cond ~ thenp ~ elsep => If(cond, thenp, elsep)
@@ -216,7 +213,8 @@ object parse extends StandardTokenParsers {
   def `import`: Parser[Import] = "import" ~> term ~ ("." ~> "{" ~> repsep(sel, ",") <~ "}") ^^ { case from ~ sels => Import(from, sels) }
 
   def `val`:    Parser[Val]    = ("val" ~> name) ~ (":" ~> typ) ~ ("=" ~> term) ^^ { case x ~ t ~ b => Val(x, t, b) }
-  def stmt:     Parser[Stmt]   = `val` | `import` | term
+  def `macro`:  Parser[Macro]  = ("macro" ~> name) ~ ("=" ~> qq) ^^ { case n ~ q => Macro(n, q) }
+  def stmt:     Parser[Stmt]   = `val` | `import` | `macro` | term
 
   def tbuiltin: Parser[Type] = ("Bool"    ^^^ Type.Bool    |
                                 "Tree"    ^^^ Type.Tree    |
@@ -310,7 +308,8 @@ object typecheck {
   // TODO: fail on forward references in blocks
   def stats(ss: List[Stmt], self: Option[Option[Name]] = None)(implicit env: Env = empty): (Type.Rec, List[Stmt]) = {
     val scope = ss.collect {
-      case Val(n, tpt, _)   => n.value -> tpt
+      case Val(n, tpt, _) => n.value -> tpt
+      case Macro(n, _, _) => n.value -> Type.Tree
     }.toMap
 
     val scopethis =
@@ -325,6 +324,8 @@ object typecheck {
         val tbody = term(body)
         if (tbody.tpe.get `<:` ttpt) Val(n, ttpt, tbody) :: loop(rest)
         else abort(s"body type ${tbody.tpe.get} isn't a subtype of ascribed type $ttpt")
+      case Macro(n, q, _) :: rest =>
+        Macro(n, q, Some(env)) :: loop(rest)
       case Import(from, sels) :: rest =>
         val tfrom = term(from)
         val binds = imp(tfrom, sels).map { case (_, to) => to }
@@ -415,54 +416,50 @@ object typecheck {
 }
 
 object expand {
-  sealed trait Transform { def apply(t: Term): Term }
-  case class Expansion(f: Term => Term) extends Transform { def apply(t: Term) = f(t) }
-  case class Renaming(to: Name) extends Transform {
-    def apply(t: Term) = t match {
-      case Ident(_, tpe) => Ident(to, tpe)
-      case _             => abort("unreachable")
-    }
-  }
-
+  type Transform = Term => Term
   type Env = Map[String, Transform]
   def empty: Env = predefined.transforms
 
   var renameId = 0
-  def rename(n: Name): Name = {
+  def rename(n: Name): (Name, Transform) = {
     renameId += 1
-    Name(n.value, lex = n.lex.copy(id = renameId))
+    val rn = Name(n.value, lex = n.lex.copy(id = renameId))
+    val tx: Transform = {
+      case Ident(_, tpe) => Ident(rn, tpe)
+      case _             => abort("unreachable")
+    }
+    (rn, tx)
   }
 
-  var markId = 0
-  def mark(t: Tree): Tree = ???
-
   def stats(trees: List[Stmt], self: Option[(Option[Name], Type.Rec)] = None)(implicit env: Env = empty): (Option[Name], List[Stmt]) = {
-    val (thisrename, nstats, transforms) =
+    val thisctx =
       self.map { case (nameopt, thistpe) =>
-        val thisrename = rename(nameopt.getOrElse(Name("this")))
-        val thistransform = Renaming(thisrename)
-        val firstrun = trees.map {
-          case Val(n, t, b) =>
-            (Val(n, t, b),
-              Some(n.value ->
-                Expansion(_ =>
-                  Select(Ident(thisrename, tpe = Some(thistpe)), n, tpe = Some(thistpe.fields(n.value))))))
-          case other => (other, None)
-        }
-        val preprocessed = firstrun.map { case (t, _) => t }
-        val transforms: List[(String, Transform)] = (firstrun.flatMap { case (_, t) => t }) :+ ("this" -> thistransform)
-        (Some(thisrename), preprocessed, transforms)
-      }.getOrElse  {
-        val firstrun = trees.map {
-          case Val(n, t, b) =>
-            val x = rename(n)
-            (Val(x, t, b), Some(n.value -> Renaming(x)))
-          case other => (other, None)
-        }
-        val preprocessed = firstrun.map { case (t, _) => t }
-        val transforms: List[(String, Transform)] = (firstrun.flatMap { case (_, t) => t })
-        (None, preprocessed, transforms)
+        val (thisrn, thistx) = rename(nameopt.getOrElse(Name("this")))
+        (thisrn, thistx, thistpe)
       }
+
+    val firstrun = trees.map {
+      case v @ Val(n, t, b) =>
+        thisctx.map { case (thisrename, _, thistpe) =>
+          val exp: Transform = { _ =>
+            Select(Ident(thisrename, tpe = Some(thistpe)), n, tpe = Some(thistpe.fields(n.value)))
+          }
+          (v, Some(n.value -> exp))
+        }.getOrElse {
+          val (rn, tx) = rename(n)
+          (Val(rn, t, b), Some(n.value -> tx))
+        }
+      case m: Macro =>
+        val exp: Transform = { _ =>
+          typecheck.term(m.body.term)(m.tenv.get)
+        }
+        (m, Some(m.name.value -> exp))
+      case other => (other, None)
+    }
+
+    val preprocessed = firstrun.map { case (t, _) => t }
+    val transforms = firstrun.flatMap { case (_, t) => t } ++ thisctx.map { case (_, tx, _) => "this" -> tx }
+    val thisrename = thisctx.map { case (r, _, _) => r }
 
     def loop(trees: List[Stmt])(implicit env: Env): List[Stmt] = trees match {
       case Nil => Nil
@@ -470,14 +467,16 @@ object expand {
         term(t) :: loop(rest)
       case Val(n, t, b) :: rest =>
         Val(n, t, term(b)) :: loop(rest)
+      case (m: Macro) :: rest =>
+        loop(rest)
       case Import(from, sels) :: rest =>
         val efrom = term(from)
         val envupd = typecheck.imp(efrom, sels).map {
-          case (nfrom, (nto, tpe)) => nto -> Expansion(_ => Select(efrom, Name(nfrom), tpe = Some(tpe)))
+          case (nfrom, (nto, tpe)) => nto -> ((_: Term) => Select(efrom, Name(nfrom), tpe = Some(tpe)))
         }
         loop(rest)(env ++ envupd)
     }
-    (thisrename, loop(nstats)(env ++ transforms))
+    (thisrename, loop(preprocessed)(env ++ transforms))
   }
 
   def term(tree: Term)(implicit env: Env = empty): Term = tree match {
@@ -495,17 +494,18 @@ object expand {
       New(nself, nstats, tpe)
     case Func(param, b, tpe) =>
       param.map { case (n, t) =>
-        val x = rename(n)
-        Func(Some(x, t), term(b)(env + (n.value -> Renaming(x))), tpe)
+        val (rn, tx) = rename(n)
+        Func(Some(rn, t), term(b)(env + (n.value -> tx)), tpe)
       }.getOrElse {
         Func(None, term(b), tpe)
       }
-    case Ident(n, tpe) =>
-      val pre = Ident(n, tpe)
-      env.get(n.value).map { f => f(pre) }.getOrElse(abort(s"panic, can't resolve $n"))
+    case Ident(Name(_, Lex(id)), _) if id != 0 =>
+      tree
+    case id @ Ident(n, tpe) =>
+      env.get(n.value).map { f => term(f(id)) }.getOrElse(abort(s"panic, can't resolve $n"))
     case If(cond, thenp, elsep, tpe) =>
       If(term(cond), term(thenp), term(elsep), tpe)
-    case pretpt: Pretyped => pretpt
+    case _: Pretyped => tree
   }
 }
 
@@ -593,8 +593,9 @@ object predefined {
   )
 
   val signatures = entries.map { case (n, (t, _)) => n -> t }.toMap
-  val transforms = entries.map { case (n, _) => n -> expand.Renaming(expand.rename(Name(n))) }.toMap
-  val funcvalues = entries.map { case (n, (_, v)) => transforms(n).asInstanceOf[expand.Renaming].to.lex.id -> v }.toMap
+  val renames    = entries.map { case (n, _) => n -> expand.rename(Name(n)) }.toMap
+  val transforms = renames.map { case (n, (_, tx)) => n -> tx }
+  val funcvalues = entries.zip(renames).map { case ((n, (_, v)), (_, (rn, _))) => rn.lex.id -> v }.toMap
 }
 
 object eval {
@@ -687,7 +688,7 @@ object eval {
         val res = eval(t)
         if (rest.isEmpty) res
         else loop(rest)(env.copy(store = res.store))
-      case (_: Import) :: rest =>
+      case (_: Import | _: Macro) :: rest =>
         abort("unreachable")
     }
 
@@ -764,22 +765,32 @@ object Test extends App {
       val five: Unit => Int = () => 5;
       val fib5eq120: Bool = fibeq (five ()) 120
     };
+
     val testany: {} = new {
       val x: Any = if true then 1 else new {}
+    };
+
+    val testmacro1: {} = new {
+      val x: Int = 1;
+      macro m = `x';
+      val U: {} = new {
+        val x: Int = 2;
+        m
+      }
     }
 
   """)
   println(parsed.map { p =>
-    val pstats = p.mkString("", "\n", "")
+    val pstats = p.mkString("", ";\n", "")
     s"parsed:\n$pstats\n"
   }.getOrElse(parsed.toString))
 
   val root = Some(Name("_root_"))
   val (troot, tstats) = typecheck.stats(parsed.get, self = Some(root))
-  println(s"typechecked:\n${tstats.map(_.toString).mkString("", "\n", "")}\n")
+  println(s"typechecked:\n${tstats.map(_.toString).mkString("", ";\n", "")}\n")
 
   val (rroot, estats) = expand.stats(tstats, self = Some((root, troot)))
-  println(s"expanded:\n${estats.mkString("", "\n", "")}\n")
+  println(s"expanded:\n${estats.mkString("", ";\n", "")}\n")
 
   val res = eval.stats(estats, self = rroot)
   println(s"evaluated: $res")
