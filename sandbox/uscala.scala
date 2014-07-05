@@ -64,15 +64,15 @@ object Tree {
   object Type {
     sealed abstract class Builtin(val name: String) extends Type
     object Builtin { def unapply(b: Builtin): Some[String] = Some(b.name) }
+    case object Any extends Builtin("Any")
     case object Bool extends Builtin("Bool")
     case object Int extends Builtin("Int")
     case object Unit extends Builtin("Unit")
     case object Tree extends Builtin("Tree")
+    case object Nothing extends Builtin("Nothing")
     case class Func(from: Type, to: Type) extends Type
     case class Rec(fields: Map[String, Type]) extends Type
     object Rec { val empty = Rec(Map.empty) }
-
-    case object Nothing extends Builtin("Nothing")
 
     implicit def show: Show[Type] = Show {
       case Type.Builtin(name)  => s(name)
@@ -183,7 +183,7 @@ object Extract {
 object parse extends StandardTokenParsers {
   lexical.delimiters ++= List("(", ")", "{", "}", ":", "=>", ".", "=", ",", ";", "`", "'", "$", "-")
   lexical.reserved   ++= List("new", "val", "import", "macro", "_", "Bool", "Tree", "Int", "Nothing",
-                              "Unit", "true", "false", "if", "then", "else")
+                              "Unit", "Any", "true", "false", "if", "then", "else")
 
   def name:   Parser[Name]  = ident                                ^^ { Name(_) }
   def id:     Parser[Ident] = name                                 ^^ { Ident(_) }
@@ -222,7 +222,8 @@ object parse extends StandardTokenParsers {
                                 "Tree"    ^^^ Type.Tree    |
                                 "Int"     ^^^ Type.Int     |
                                 "Nothing" ^^^ Type.Nothing |
-                                "Unit"    ^^^ Type.Unit    )
+                                "Unit"    ^^^ Type.Unit    |
+                                "Any"     ^^^ Type.Any     )
   def trec:     Parser[Type] = "{" ~> repsep(name ~ (":" ~> typ), ",") <~ "}" ^^ {
     fields => Type.Rec(fields.map { case a ~ b => (a.value, b) }.toMap)
   }
@@ -245,7 +246,8 @@ object typecheck {
 
   implicit class Subtype(me: Type) {
     def `<:`(other: Type): Boolean = (me, other) match {
-      case (a, b) if a == b => true
+      case (_, Type.Any)                          => true
+      case (a, b) if a == b                       => true
       case (Type.Func(s1, s2), Type.Func(t1, t2)) => t1 `<:` s1 && s2 `<:` t2
       case (Type.Rec(fields1), Type.Rec(fields2)) =>
         fields1.forall { case (n, t) =>
@@ -259,7 +261,7 @@ object typecheck {
     case (a, b) if a == b                       => a
     case (Type.Rec(fields1), Type.Rec(fields2)) => Type.Rec(intersect(fields1, fields2)(lub))
     case (Type.Func(s1, s2), Type.Func(t1, t2)) => Type.Func(glb(s1, t1), lub(s2, t2))
-    case _                                      => Type.Rec.empty
+    case _                                      => Type.Any
   }
 
   def glb(t1: Type, t2: Type): Type = (t1, t2) match {
@@ -653,7 +655,8 @@ object eval {
   def default(t: Type): Value.Stack = t match {
     case Type.Rec(_)     |
          Type.Func(_, _) |
-         Type.Tree       => Value.Ptr(0)
+         Type.Tree       |
+         Type.Any        => Value.Ptr(0)
     case Type.Bool       => Value.False
     case Type.Int        => Value.Int(0)
     case Type.Unit       => Value.Unit
@@ -749,19 +752,22 @@ object eval {
 
 object Test extends App {
   val parsed = parse("""
-    val Fib: { fib: Int => Int } = new {
+    val testfib: {} = new {
       val fib: Int => Int = (x: Int) =>
         if eq x 0 then 1
         else if eq x 1 then 1
-        else mul x (fib (sub x 1))
+        else mul x (fib (sub x 1));
+      val fibeq: Int => Int => Bool = (x: Int) => (exp: Int) => {
+        val tmp: Int = fib(x);
+        eq tmp exp
+      };
+      val five: Unit => Int = () => 5;
+      val fib5eq120: Bool = fibeq (five ()) 120
     };
-    import Fib.{_};
-    val fibeq: Int => Int => Bool = (x: Int) => (exp: Int) => {
-      val tmp: Int = fib(x);
-      eq tmp exp
-    };
-    val f: Unit => Int = () => 5;
-    val fib5eq120: Bool = fibeq (f ()) 120
+    val testany: {} = new {
+      val x: Any = if true then 1 else new {}
+    }
+
   """)
   println(parsed.map { p =>
     val pstats = p.mkString("", "\n", "")
