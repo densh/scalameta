@@ -530,7 +530,7 @@ object Value {
   object Ref {
     implicit def show(implicit store: eval.Store): Show[Value.Ref] = Show {
       case Value.Func(_)     => s("ƒ")
-      case Value.Tree(t)     => s("`", Term.show(t), "'")
+      case Value.Tree(t)     => s("`", t, "'")
       case Value.Obj(fields) => s("{", r(fields.toList.map { case (n, v) => s(n, " = ", v) }, ", "), "}")
     }
   }
@@ -651,11 +651,13 @@ object eval {
   }
 
   def default(t: Type): Value.Stack = t match {
-    case Type.Rec(_) | Type.Func(_, _) | Type.Tree => Value.Ptr(0)
-    case Type.Bool                                 => Value.False
-    case Type.Int                                  => Value.Int(0)
-    case Type.Unit                                 => Value.Unit
-    case Type.Nothing                              => abort("unreachable")(null)
+    case Type.Rec(_)     |
+         Type.Func(_, _) |
+         Type.Tree       => Value.Ptr(0)
+    case Type.Bool       => Value.False
+    case Type.Int        => Value.Int(0)
+    case Type.Unit       => Value.Unit
+    case Type.Nothing    => abort("unreachable")(null)
   }
 
   def stats(stats: List[Stmt], self: Option[Name] = None)(implicit env: Env = Env.default): Res = {
