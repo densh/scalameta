@@ -88,12 +88,12 @@ object Tree {
   sealed trait Stmt extends Tree
   object Stmt {
     case class Val(name: Name, typ: Type, value: Term) extends Stmt
-    case class Macro(name: Name, tpt: Type, body: Term.Quasiquote, tenv: Option[typecheck.Env] = None) extends Stmt
+    case class Macro(name: Name, tpt: Type, body: Term.Quasiquote) extends Stmt
     case class Import(from: Term, sels: List[Sel]) extends Stmt
 
     implicit val show: Show[Stmt] = Show {
       case Val(n, t, value)   => s("val ", n, ": ", t, " = ", value)
-      case Macro(n, t, q, _)  => s("macro ", n, ": ", t, " = ", (q: Term))
+      case Macro(n, t, q)     => s("macro ", n, ": ", t, " = ", (q: Term))
       case Import(from, sels) => s("import ", from, ".{", r(sels, ", "), "}")
       case t: Term            => s(t)
     }
@@ -110,7 +110,8 @@ object Tree {
     case class Select(prefix: Term, name: Name, tpe: Option[Type] = None) extends Term
     case class Ident(name: Name, tpe: Option[Type] = None) extends Term
     case class If(cond: Term, thenp: Term, elsep: Term, tpe: Option[Type] = None) extends Term
-    case class Quasiquote(term: Term) extends Pretyped { val tpe = Some(Type.Tree) }
+    case class Quasiquote(term: Term, tenv: Option[typecheck.Env] = None,
+                                      renv: Option[expand.Env] = None) extends Pretyped { val tpe = Some(Type.Tree) }
     case class Integer(value: Int) extends Pretyped { val tpe = Some(Type.Int) }
     case object True extends Pretyped { val tpe = Some(Type.Bool) }
     case object False extends Pretyped { val tpe = Some(Type.Bool) }
@@ -130,7 +131,7 @@ object Tree {
         case Select(pre, name, _)      => s(pre, ".", name)
         case Ident(name, _)            => s(name)
         case If(cond, thenp, elsep, _) => s("if ", cond, " then ", thenp, " else ", elsep)
-        case Quasiquote(t: Term)       => s("`", t, "'")
+        case Quasiquote(t: Term, _, _) => s("`", t, "'")
         case True                      => s("true")
         case False                     => s("false")
         case Integer(v)                => s(v.toString)
@@ -195,7 +196,7 @@ object parse extends StandardTokenParsers {
                                 case Some(x ~ t) ~ b => Func(Some((x, t)), b)
                               }
   def parens: Parser[Term]  = "(" ~> opt(term) <~ ")"              ^^ { _.getOrElse(Term.Unit) }
-  def qq:     Parser[Term.Quasiquote]  = "`" ~> term <~ "'"        ^^ { Quasiquote(_) }
+  def qq:     Parser[Quasiquote]  = "`" ~> term <~ "'"        ^^ { Quasiquote(_) }
 
   def `if`:   Parser[Term]  = ("if" ~> term) ~ ("then" ~> term) ~ ("else" ~> term) ^^ {
                                 case cond ~ thenp ~ elsep => If(cond, thenp, elsep)
@@ -308,8 +309,8 @@ object typecheck {
   // TODO: fail on forward references in blocks
   def stats(ss: List[Stmt], self: Option[Option[Name]] = None)(implicit env: Env = empty): (Type.Rec, List[Stmt]) = {
     val scope = ss.collect {
-      case Val(n, tpt, _)      => n.value -> tpt
-      case Macro(n, tpt, _, _) => n.value -> tpt
+      case Val(n, tpt, _)   => n.value -> tpt
+      case Macro(n, tpt, _) => n.value -> tpt
     }.toMap
 
     val scopethis =
@@ -324,8 +325,9 @@ object typecheck {
         val tbody = term(body)
         if (tbody.tpe.get `<:` ttpt) Val(n, ttpt, tbody) :: loop(rest)
         else abort(s"body type ${tbody.tpe.get} isn't a subtype of ascribed type $ttpt")
-      case Macro(n, t, q, _) :: rest =>
-        Macro(n, t, q, Some(env)) :: loop(rest)
+      case Macro(n, t, q) :: rest =>
+        val __ @ (tq: Quasiquote) = term(q)
+        Macro(n, t, tq) :: loop(rest)
       case Import(from, sels) :: rest =>
         val tfrom = term(from)
         val binds = imp(tfrom, sels).map { case (_, to) => to }
@@ -403,6 +405,9 @@ object typecheck {
       val telsep = term(elsep)
       If(tcond, tthenp, telsep, tpe = Some(lub(tthenp.tpe.get, telsep.tpe.get)))
 
+    case Quasiquote(t, _, _) =>
+      Quasiquote(t, tenv = Some(env))
+
     case pretpt: Pretyped =>
       pretpt
   }
@@ -416,7 +421,7 @@ object typecheck {
 }
 
 object expand {
-  final case class Tx(f: Term => Term, env: Option[Env] = None)
+  final case class Tx(f: Term => Term)
   final case class Env(txs: Map[String, Tx] = predefined.transforms)
 
   var renameId = 0
@@ -459,13 +464,16 @@ object expand {
         term(t) :: loop(rest)
       case Val(n, t, b) :: rest =>
         Val(n, t, term(b)) :: loop(rest)
-      case Macro(n, t, body, tenv) :: rest =>
+      case Macro(n, t, body) :: rest =>
+        val __ @ (rbody: Quasiquote) = term(body)
         val tx = Tx({ _ =>
           import typecheck.Subtype
-          val texpansion = typecheck.term(body.term)(tenv.get)
+          val expansion  = rbody.term
+          val texpansion = typecheck.term(expansion)(rbody.tenv.get)
           if (!(texpansion.tpe.get `<:` t)) abort(s"macro expansion type ${texpansion.tpe.get} doesn't conform to $t")
-          texpansion
-        }, Some(env))
+          val rexpansion = expand.term(texpansion)(rbody.renv.get)
+          rexpansion
+        })
         loop(rest)(Env(env.txs + (n.value -> tx)))
       case Import(from, sels) :: rest =>
         val efrom = term(from)
@@ -500,9 +508,11 @@ object expand {
     case Ident(Name(_, Lex(id)), _) if id != 0 =>
       tree
     case id @ Ident(n, tpe) =>
-      env.txs.get(n.value).map { tx => term(tx.f(id))(tx.env.getOrElse(env)) }.getOrElse(abort(s"panic, can't resolve $n (${env.txs})"))
+      env.txs.get(n.value).map { tx => tx.f(id) }.getOrElse(abort(s"panic, can't resolve $n (${env.txs})"))
     case If(cond, thenp, elsep, tpe) =>
       If(term(cond), term(thenp), term(elsep), tpe)
+    case Quasiquote(t, tenv, _) =>
+      Quasiquote(t, tenv, renv = Some(env))
     case _: Pretyped => tree
   }
 }
@@ -676,8 +686,11 @@ object eval {
       case v @ Val(name, tpt, body) :: rest =>
         val res = eval(body)
         val store = selfrefopt.map { selfref =>
-          res.store.mapOn(selfref.id) { case Value.Obj(fields) =>
-            Value.Obj(fields + (name.value -> res.value))
+          res.store.mapOn(selfref.id) {
+            case Value.Obj(fields) =>
+              Value.Obj(fields + (name.value -> res.value))
+            case _ =>
+              abort("unreachable")
           }
         }.getOrElse(res.store)
         val nenv = selfrefopt.map { _ => env }.getOrElse(env.bind(name, res.value)).copy(store = store)
@@ -737,7 +750,7 @@ object eval {
         val Res(econd, s) = eval(cond)
         val branch = if (econd == Value.True) thenp else elsep
         eval(branch)(env.copy(store = s))
-      case Quasiquote(t)    =>
+      case Quasiquote(t, _, _) =>
         val qvalue = Value.Tree(t)
         env.store.alloc(qvalue)
       case Ascribe(t, _, _) => eval(t)
@@ -773,5 +786,5 @@ object Test extends App {
   println(s"expanded:\n${estats.mkString("", ";\n", "")}\n")
 
   val res = eval.stats(estats, self = rroot)
-  println(s"evaluated: $res")
+  println(s"evaluated:\n$res")
 }
