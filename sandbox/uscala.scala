@@ -322,11 +322,7 @@ object typecheck {
       case Val(n, tpt, body) :: rest =>
         val ttpt = typ(tpt)
         val tbody = term(body)
-        println(s"calling ${tbody.tpe.get} <: $ttpt")
-        if (tbody.tpe.get `<:` ttpt) {
-          println(s"${tbody.tpe.get} <: $ttpt")
-          Val(n, ttpt, tbody) :: loop(rest)
-        }
+        if (tbody.tpe.get `<:` ttpt) Val(n, ttpt, tbody) :: loop(rest)
         else abort(s"body type ${tbody.tpe.get} isn't a subtype of ascribed type $ttpt")
       case Macro(n, t, q, _) :: rest =>
         Macro(n, t, q, Some(env)) :: loop(rest)
@@ -755,23 +751,6 @@ object eval {
 
 object Test extends App {
   val parsed = parse("""
-    val testfib: {} = new {
-      val fib: Int => Int = (x: Int) =>
-        if eq x 0 then 1
-        else if eq x 1 then 1
-        else mul x (fib (sub x 1));
-      val fibeq: Int => Int => Bool = (x: Int) => (exp: Int) => {
-        val tmp: Int = fib(x);
-        eq tmp exp
-      };
-      val five: Unit => Int = () => 5;
-      val fib5eq120: Bool = fibeq (five ()) 120
-    };
-
-    val testany: {} = new {
-      val x: Any = if true then 1 else new {}
-    };
-
     val testmacro1: {} = new {
       val x: Int = 1;
       macro m: Int = `x';
@@ -780,7 +759,6 @@ object Test extends App {
         m
       }
     }
-
   """)
   println(parsed.map { p =>
     val pstats = p.mkString("", ";\n", "")
