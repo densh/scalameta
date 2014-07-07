@@ -111,15 +111,15 @@ object Tree {
     case class Select(prefix: Term, name: Name, tpe: Option[Type] = None) extends Term
     case class Ident(name: Name, tpe: Option[Type] = None) extends Term
     case class If(cond: Term, thenp: Term, elsep: Term, tpe: Option[Type] = None) extends Term
-    case class Quote(term: InCtx) extends Pretyped { val tpe = Some(Type.Term) }
+    case class Quote(term: Captured) extends Pretyped { val tpe = Some(Type.Term) }
     case class Unquote(term: Term) extends Pretyped { val tpe = None }
     case class Integer(value: Int) extends Pretyped { val tpe = Some(Type.Int) }
     case object True extends Pretyped { val tpe = Some(Type.Bool) }
     case object False extends Pretyped { val tpe = Some(Type.Bool) }
     case object Unit extends Pretyped { val tpe = Some(Type.Unit) }
-    case class InCtx(term: Term,
-                     tenv: Option[typecheck.Env] = None,
-                     renv: Option[expand.Env] = None) extends Term { def tpe = term.tpe }
+    case class Captured(term: Term,
+                        tenv: Option[typecheck.Env] = None,
+                        renv: Option[expand.Env] = None) extends Term { def tpe = term.tpe }
 
     implicit val show: Show[Term] = Show { t =>
       val raw = t match {
@@ -142,7 +142,7 @@ object Tree {
         case False                     => s("false")
         case Integer(v)                => s(v.toString)
         case Unit                      => s("()")
-        case InCtx(t, _, _)            => s("<", t, ">")
+        case Captured(t, _, _)         => s("<", t, ">")
       }
       //t.tpe.map { tpe => s("(", raw, " :: ", tpe, ")") }.getOrElse(raw)
       raw
@@ -205,7 +205,7 @@ object parse extends StandardTokenParsers {
     case Some(x ~ t) ~ b => Func(Some((x, t)), b)
   }
   def parens(d: Int):  Parser[Term]    = "(" ~> opt(term(d)) <~ ")"        ^^ { _.getOrElse(Term.Unit) }
-  def quote(d: Int):   Parser[Quote]   = "`" ~> term(d = d + 1) <~ "'"     ^^ { t => Quote(InCtx(t)) }
+  def quote(d: Int):   Parser[Quote]   = "`" ~> term(d = d + 1) <~ "'"     ^^ { t => Quote(Captured(t)) }
   def unquote(d: Int): Parser[Unquote] = ("$" ~> id                        ^^ { Unquote(_) } |
                                           "$" ~> "{" ~> term(d - 1) <~ "}" ^^ { Unquote(_) } )
 
@@ -281,7 +281,7 @@ abstract class Transform {
     case Func(param, body, tpe)      => Func(param.map { case (n, t) => (name(n), typ(t)) }, term(body), tpe.map(typ))
     case If(cond, thenp, elsep, tpe) => If(term(cond), term(thenp), term(elsep), tpe.map(typ))
     case Select(qual, n, tpe)        => Select(term(qual), name(n), tpe.map(typ))
-    case InCtx(t, tenv, renv)        => InCtx(term(t), tenv, renv)
+    case Captured(t, tenv, renv)     => Captured(term(t), tenv, renv)
   }
   def typ(t: Type): Type = t match {
     case _: Type.Builtin     => t
@@ -459,9 +459,9 @@ object typecheck {
     case q: Quote =>
       quote(q)
 
-    case InCtx(t, tenvopt, renvopt) =>
+    case Captured(t, tenvopt, renvopt) =>
       val tenv = tenvopt.getOrElse(env)
-      InCtx(term(t)(tenv), tenvopt, renvopt)
+      Captured(term(t)(tenv), tenvopt, renvopt)
 
     case _: Unquote =>
       unreachable
@@ -481,8 +481,8 @@ object typecheck {
           super.term(t)
       }
     }
-    val Quote(InCtx(term, _, _)) = q
-    Quote(InCtx(UnquoteTypecheck.term(term), tenv = Some(env)))
+    val Quote(Captured(term, _, _)) = q
+    Quote(Captured(UnquoteTypecheck.term(term), tenv = Some(env)))
   }
 
   def typ(tree: Type)(implicit env: Env = empty): Type = tree match {
@@ -585,7 +585,7 @@ object expand {
       env.txs.get(n.value).map { tx => tx.f(id) }.getOrElse(abort(s"panic, can't resolve $n (${env.txs})"))
     case If(cond, thenp, elsep, tpe) =>
       If(term(cond), term(thenp), term(elsep), tpe)
-    case InCtx(t, _, renvopt) =>
+    case Captured(t, _, renvopt) =>
       val renv = renvopt.getOrElse(env)
       term(t)(renv)
     case q: Quote =>
@@ -600,8 +600,8 @@ object expand {
         case _             => super.term(t)
       }
     }
-    val Quote(InCtx(term, tenv, _)) = q
-    Quote(InCtx(ExpandUnquote.term(term), tenv, renv = Some(env)))
+    val Quote(Captured(term, tenv, _)) = q
+    Quote(Captured(ExpandUnquote.term(term), tenv, renv = Some(env)))
   }
 }
 
@@ -837,13 +837,13 @@ object eval {
       val Res(econd, s) = eval.term(cond)
       val branch = if (econd == Value.True) thenp else elsep
       eval.term(branch)(env.copy(store = s))
-    case q: Quote                => eval.quote(q)
-    case (_: Unquote | _: InCtx) => unreachable
-    case Ascribe(t, _, _)        => eval.term(t)
-    case True                    => Res(Value.True, env.store)
-    case False                   => Res(Value.False, env.store)
-    case Integer(v)              => Res(Value.Int(v), env.store)
-    case Unit                    => Res(Value.Unit, env.store)
+    case q: Quote                   => eval.quote(q)
+    case (_: Unquote | _: Captured) => unreachable
+    case Ascribe(t, _, _)           => eval.term(t)
+    case True                       => Res(Value.True, env.store)
+    case False                      => Res(Value.False, env.store)
+    case Integer(v)                 => Res(Value.Int(v), env.store)
+    case Unit                       => Res(Value.Unit, env.store)
   }
 
   def quote(q: Quote)(implicit env: Env = Env.default): Res = {
