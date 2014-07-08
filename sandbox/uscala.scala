@@ -324,11 +324,13 @@ object semantic {
 import semantic._
 
 object typecheck {
-  type Env = Map[String, Type]
-  def empty: Env = predefined.signatures
+  final case class Env(types: Map[String, Type] = predefined.signatures) {
+    def bindType(binding: (String, Type)) = Env(types + binding)
+    def bindTypes(bindings: Iterable[(String, Type)]) = Env(types ++ bindings)
+  }
 
   // TODO: validate selectors
-  def imp(from: Term, sels: List[Sel])(implicit env: Env = empty): List[(String, (String, Type))] = {
+  def imp(from: Term, sels: List[Sel])(implicit env: Env = Env()): List[(String, (String, Type))] = {
     val (wildcards, nonwild) = sels.span(_ == Sel.Wildcard)
     val (exclusions, nonexcluded) = nonwild.span(_.isInstanceOf[Sel.Exclude])
     val members: Map[String, Type] = from.tpe.get match {
@@ -364,7 +366,7 @@ object typecheck {
   }
 
   // TODO: fail on forward references in blocks
-  def stats(ss: List[Stmt], self: Option[Option[Name]] = None)(implicit env: Env = empty): (Type.Rec, List[Stmt]) = {
+  def stats(ss: List[Stmt], self: Option[Option[Name]] = None)(implicit env: Env = Env()): (Type.Rec, List[Stmt]) = {
     val scope = ss.collect {
       case Val(n, tpt, _)           => n.value -> tpt
       case Macro(n, params, tpt, _) => n.value -> params.map(_.typ).foldRight(tpt) { Type.Func(_, _) }
@@ -384,28 +386,28 @@ object typecheck {
         else abort(s"body type ${tbody.tpe.get} isn't a subtype of ascribed type $ttpt")
       case Macro(n, params, t, b) :: rest =>
         val envupd = params.map { p => p.name.value -> Type.Term }
-        Macro(n, params, t, term(b)(env ++ envupd)) :: loop(rest)
+        Macro(n, params, t, term(b)(env bindTypes envupd)) :: loop(rest)
       case Import(from, sels) :: rest =>
         val tfrom = term(from)
         val binds = imp(tfrom, sels).map { case (_, to) => to }
-        Import(tfrom, sels) :: loop(rest)(env ++ binds)
+        Import(tfrom, sels) :: loop(rest)(env bindTypes binds)
       case (t: Term) :: rest =>
         term(t) :: loop(rest)
     }
 
-    (Type.Rec(scope.toMap), loop(ss)(env ++ scopethis))
+    (Type.Rec(scope.toMap), loop(ss)(env bindTypes scopethis))
   }
 
-  def term(tree: Term)(implicit env: Env = empty): Term = tree match {
+  def term(tree: Term)(implicit env: Env = Env()): Term = tree match {
     case Ident(n, _) =>
-      if (!env.contains(n.value)) abort(s"$n is not in scope")
-      else Ident(n, tpe = Some(env(n.value)))
+      if (!env.types.contains(n.value)) abort(s"$n is not in scope")
+      else Ident(n, tpe = Some(env.types(n.value)))
 
     case Func(param, body, _) =>
       val (tparam, ttpt, tbody) = param.map { case Param(x, tpt) =>
         val tx = Name(x.value)
         val ttpt = typ(tpt)
-        val tbody = term(body)(env + (tx.value -> ttpt))
+        val tbody = term(body)(env bindType (tx.value -> ttpt))
         (Some(Param(tx, ttpt)), ttpt, tbody)
       }.getOrElse {
         val tbody = term(body)
@@ -476,7 +478,7 @@ object typecheck {
       pretpt
   }
 
-  def quote(q: Quote)(implicit env: Env = empty): Quote = {
+  def quote(q: Quote)(implicit env: Env = Env()): Quote = {
     object UnquoteTypecheck extends Transform {
       override def term(t: Term): Term = t match {
         case Unquote(inner) =>
@@ -491,7 +493,7 @@ object typecheck {
     Quote(Captured(UnquoteTypecheck.term(term), tenv = Some(env)))
   }
 
-  def typ(tree: Type)(implicit env: Env = empty): Type = tree match {
+  def typ(tree: Type)(implicit env: Env = Env()): Type = tree match {
     case builtin: Type.Builtin    => builtin
     case Type.Func(from, to)      => Type.Func(typ(from), typ(to))
     // TODO: validate that there no repetion a-la { val x: {} val x: {} }
