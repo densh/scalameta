@@ -176,7 +176,6 @@ object Tree {
 }
 import Tree._, Stmt._, Term._
 
-
 trait Convert[From, To] { def apply(from: From): To }
 object Convert {
   def apply[From, To](f: From => To): Convert[From, To] =
@@ -295,12 +294,9 @@ abstract class Transform {
   def param(p: Param): Param = Param(name(p.name), typ(p.typ))
 }
 
-object typecheck {
-  type Env = Map[String, Type]
-  def empty: Env = predefined.signatures
-
-  implicit class Subtype(me: Type) {
-    def `<:`(other: Type): Boolean = (me, other) match {
+object semantic {
+  implicit class SemanticType(t1: Type) {
+    def `<:`(t2: Type): Boolean = (t1, t2) match {
       case (Type.Any, _)                          => true
       case (a, b) if a == b                       => true
       case (Type.Func(s1, s2), Type.Func(t1, t2)) => t1 `<:` s1 && s2 `<:` t2
@@ -310,21 +306,26 @@ object typecheck {
         }
       case (_, _) => false
     }
-  }
+    def lub(t2: Type): Type = (t1, t2) match {
+      case (a, b) if a == b                       => a
+      case (Type.Rec(fields1), Type.Rec(fields2)) => Type.Rec(intersect(fields1, fields2)(_ lub _))
+      case (Type.Func(s1, s2), Type.Func(t1, t2)) => Type.Func(s1 glb t1, s2 lub t2)
+      case _                                      => Type.Any
+    }
 
-  def lub(t1: Type, t2: Type): Type = (t1, t2) match {
-    case (a, b) if a == b                       => a
-    case (Type.Rec(fields1), Type.Rec(fields2)) => Type.Rec(intersect(fields1, fields2)(lub))
-    case (Type.Func(s1, s2), Type.Func(t1, t2)) => Type.Func(glb(s1, t1), lub(s2, t2))
-    case _                                      => Type.Any
+    def glb(t2: Type): Type = (t1, t2) match {
+      case (a, b) if a == b                       => a
+      case (Type.Rec(fields1), Type.Rec(fields2)) => Type.Rec(merge(fields1, fields2)(_ glb _))
+      case (Type.Func(s1, s2), Type.Func(t1, t2)) => Type.Func(s1 lub s2, s2 glb t2)
+      case _                                      => Type.Nothing
+    }
   }
+}
+import semantic._
 
-  def glb(t1: Type, t2: Type): Type = (t1, t2) match {
-    case (a, b) if a == b                       => a
-    case (Type.Rec(fields1), Type.Rec(fields2)) => Type.Rec(merge(fields1, fields2)(glb))
-    case (Type.Func(s1, s2), Type.Func(t1, t2)) => Type.Func(lub(s1, t1), glb(s2, t2))
-    case _                                      => Type.Nothing
-  }
+object typecheck {
+  type Env = Map[String, Type]
+  def empty: Env = predefined.signatures
 
   // TODO: validate selectors
   def imp(from: Term, sels: List[Sel])(implicit env: Env = empty): List[(String, (String, Type))] = {
@@ -459,7 +460,7 @@ object typecheck {
       if (tcond.tpe.get != Type.Bool) abort(s"if condition must be Bool, not ${tcond.tpe}")
       val tthenp = term(thenp)
       val telsep = term(elsep)
-      If(tcond, tthenp, telsep, tpe = Some(lub(tthenp.tpe.get, telsep.tpe.get)))
+      If(tcond, tthenp, telsep, tpe = Some(tthenp.tpe.get lub telsep.tpe.get))
 
     case q: Quote =>
       quote(q)
@@ -497,7 +498,6 @@ object typecheck {
     case Type.Rec(fields)         => Type.Rec(fields.map { case (n, t) => (n, typ(t)) })
   }
 }
-import typecheck.Subtype
 
 object expand {
   sealed trait AbsTx
