@@ -53,7 +53,7 @@ object Lex {
 
 sealed trait Tree { override def toString = Tree.show(this).toString }
 object Tree {
-  case class Name(value: String, lex: Lex = Lex.empty) extends Sel
+  case class Name(value: String, lex: Lex = Lex.empty) extends Tree
   object Name { implicit val show: Show[Name] = Show { n => s(n.value, n.lex) } }
 
   case class Param(name: Name, typ: Type) extends Tree
@@ -93,12 +93,12 @@ object Tree {
   object Stmt {
     case class Val(name: Name, typ: Type, value: Term) extends Stmt
     case class Macro(name: Name, params: List[Param], res: Type, body: Term) extends Stmt
-    case class Import(from: Term, sels: List[Sel]) extends Stmt
+    case class Import(from: Term) extends Stmt
 
     implicit val show: Show[Stmt] = Show {
       case Val(n, t, value)       => s("val ", n, ": ", t, " = ", value)
       case Macro(n, params, t, b) => s("macro ", n, "(", r(params, ", "), "): ", t, " = ", b)
-      case Import(from, sels)     => s("import ", from, ".{", r(sels, ", "), "}")
+      case Import(from)           => s("import ", from, "._")
       case t: Term                => s(t)
     }
   }
@@ -152,25 +152,10 @@ object Tree {
     }
   }
 
-  sealed trait Sel extends Tree
-  object Sel {
-    case class Rename(from: Name, to: Name) extends Sel
-    case class Exclude(name: Name) extends Sel
-    case object Wildcard extends Sel
-
-    implicit val show: Show[Sel] = Show {
-      case n: Name         => Tree.show(n)
-      case Rename(fr, to)  => s(fr, " => ", to)
-      case Exclude(n)      => s(n, " => _")
-      case Wildcard        => s("_")
-    }
-  }
-
   implicit val show: Show[Tree] = Show {
     case t: Type  => s(t)
     case t: Stmt  => s(t)
     case t: Name  => s(t)
-    case t: Sel   => s(t)
     case t: Param => s(t)
   }
 }
@@ -221,19 +206,11 @@ object parse extends StandardTokenParsers {
     val always = `if`(d) | bool | id | block(d) | `new`(d) | func(d) | parens(d) | quote(d) | num
     if (d > 0) always | unquote(d) else always
   }
-  def term2(d: Int):  Parser[Term]  = term1(d) ~ opt("." ~> name)   ^^ { case x ~ y => (x /: y)(Select(_, _)) }
-  def term3(d: Int):  Parser[Term]  = term2(d) ~ opt(":" ~> typ)    ^^ { case x ~ t => (x /: t)(Ascribe(_, _)) }
+  def term2(d: Int):  Parser[Term]  = term1(d) ~ opt("." ~> name) ^^ { case x ~ y => (x /: y)(Select(_, _)) }
+  def term3(d: Int):  Parser[Term]  = term2(d) ~ opt(":" ~> typ)  ^^ { case x ~ t => (x /: t)(Ascribe(_, _)) }
   def term(d: Int):   Parser[Term]  = term3(d) ~ rep(term3(d))    ^^ { case x ~ y => (x /: y)(Apply(_, _)) }
 
-  def nameOrWildcard: Parser[Name => Sel] = (name ^^ ((y: Name) => (x: Name) => Sel.Rename(x, y))) |
-                                            ("_" ^^^ ((x: Name) => Sel.Exclude(x)))
-  def sel: Parser[Sel]  = (name ~ opt("=>" ~> nameOrWildcard)  ^^
-                           { case x ~ fopt => fopt.map(f => f(x)).getOrElse(x) }) |
-                          ("_" ^^^ Sel.Wildcard)
-
-  def `import`(d: Int): Parser[Import] = "import" ~> term(d) ~ ("." ~> "{" ~> repsep(sel, ",") <~ "}") ^^ {
-    case from ~ sels => Import(from, sels)
-  }
+  def `import`(d: Int): Parser[Import] = "import" ~> term(d) <~ "." <~ "_"                 ^^ { Import(_) }
   def `val`(d: Int):    Parser[Val]    = ("val" ~> name) ~ (":" ~> typ) ~ ("=" ~> term(d)) ^^ {
     case x ~ t ~ b => Val(x, t, b)
   }
@@ -267,9 +244,9 @@ object parse extends StandardTokenParsers {
 abstract class Transform {
   def stats(s: List[Stmt]): List[Stmt] = s match {
     case Nil                               => Nil
-    case (t: Term)                 :: rest => term(t)                          :: stats(rest)
-    case Val(n, t, body)           :: rest => Val(name(n), typ(t), term(body)) :: stats(rest)
-    case Import(from, sels)        :: rest => Import(term(from), sels)         :: stats(rest)
+    case (t: Term) :: rest                 => term(t) :: stats(rest)
+    case Val(n, t, body) :: rest           => Val(name(n), typ(t), term(body)) :: stats(rest)
+    case Import(from) :: rest              => Import(term(from)) :: stats(rest)
     case Macro(n, params, t, body) :: rest => Macro(name(n), params.map(param), typ(t), term(body)) :: stats(rest)
   }
   def term(t: Term): Term = t match {
@@ -329,40 +306,9 @@ object typecheck {
     def bindTypes(bindings: Iterable[(String, Type)]) = Env(types ++ bindings)
   }
 
-  // TODO: validate selectors
-  def imp(from: Term, sels: List[Sel])(implicit env: Env = Env()): List[(String, (String, Type))] = {
-    val (wildcards, nonwild) = sels.span(_ == Sel.Wildcard)
-    val (exclusions, nonexcluded) = nonwild.span(_.isInstanceOf[Sel.Exclude])
-    val members: Map[String, Type] = from.tpe.get match {
-      case Type.Rec(members) => members
-      case _                 => Map.empty
-    }
-    def getmember(n: Name): Type = {
-      val opt: Option[Type] = members.get(n.value)
-      opt.getOrElse { abort(s"can't import $n as it's not defined in $from") }
-    }
-    wildcards match {
-      case Nil =>
-        if (exclusions.nonEmpty) abort("can't exclude without a wildcard")
-        nonexcluded.map {
-          case n: Name              => n.value    -> (n.value -> getmember(n))
-          case Sel.Rename(from, to) => from.value -> (to.value -> getmember(from))
-          case _                    => unreachable
-        }
-      case _ :: Nil =>
-        def loop(m: Map[String, (String, Type)], ops: List[Sel]): Map[String, (String, Type)] = ops match {
-          case Nil                          => m
-          case (n: Name) :: rest            => getmember(n); loop(m, rest)
-          case Sel.Rename(from, to) :: rest =>
-            val tpe = getmember(from)
-            loop(m - from.value + (from.value -> (to.value -> tpe)), rest)
-          case Sel.Exclude(n) :: rest       => getmember(n); loop(m - n.value, rest)
-          case _                            => unreachable
-        }
-        loop(members.map { case (k, v) => k -> (k -> v) }, nonwild).toList
-      case _ :: _ :: _  =>
-        abort("can't have more than one wildcard")
-    }
+  def imp(from: Term)(implicit env: Env = Env()): Map[String, Type] = from.tpe.get match {
+    case Type.Rec(members) => members
+    case _                 => Map.empty
   }
 
   // TODO: fail on forward references in blocks
@@ -387,10 +333,10 @@ object typecheck {
       case Macro(n, params, t, b) :: rest =>
         val envupd = params.map { p => p.name.value -> Type.Term }
         Macro(n, params, t, term(b)(env bindTypes envupd)) :: loop(rest)
-      case Import(from, sels) :: rest =>
+      case Import(from) :: rest =>
         val tfrom = term(from)
-        val binds = imp(tfrom, sels).map { case (_, to) => to }
-        Import(tfrom, sels) :: loop(rest)(env bindTypes binds)
+        val binds = imp(tfrom)
+        Import(tfrom) :: loop(rest)(env bindTypes binds)
       case (t: Term) :: rest =>
         term(t) :: loop(rest)
     }
@@ -563,10 +509,10 @@ object expand {
           rexp
         })
         loop(rest)(Env(env.txs + (n.value -> tx)))
-      case Import(from, sels) :: rest =>
+      case Import(from) :: rest =>
         val efrom = term(from)
-        val envupd = typecheck.imp(efrom, sels).map {
-          case (nfrom, (nto, tpe)) => nto -> Tx { _ => Select(efrom, Name(nfrom), tpe = Some(tpe)) }
+        val envupd = typecheck.imp(efrom).map {
+          case (n, tpe) => n -> Tx { _ => Select(efrom, Name(n), tpe = Some(tpe)) }
         }
         loop(rest)(Env(env.txs ++ envupd))
     }
