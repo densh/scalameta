@@ -313,7 +313,7 @@ object attribute {
   }
 
   // TODO: fail on forward references in blocks
-  def stats(ss: List[Stmt], self: Option[Option[Name]] = None)(implicit env: Env = Env()): (Option[(String, Attr)], Type.Rec, List[Stmt]) = {
+  def stats(ss: List[Stmt], self: Option[Option[Name]] = None)(implicit env: Env = Env()): (Option[(String, Attr)], List[Stmt]) = {
     val thisv: Option[String] = self.map { _.map(_.value).getOrElse("this") }
     val thisid   = freshId
 
@@ -361,7 +361,7 @@ object attribute {
         term(t) :: loop(rest)
     }
 
-    (thisbind, thistype, loop(ss)(env ++ scope))
+    (thisbind, loop(ss)(env ++ scope))
   }
 
   def term(tree: Term)(implicit env: Env = Env()): Term = tree match {
@@ -396,15 +396,15 @@ object attribute {
       }
 
     case Block(blockstats, _) =>
-      val (_, _, tstats) = stats(blockstats, self = None)
+      val (_, tstats) = stats(blockstats, self = None)
       Block(tstats, tpe = tstats match {
         case _ :+ (t: Term) => t.tpe
         case _              => Some(Type.Rec.empty)
       })
 
     case New(selfopt, newstats, _) =>
-      val (thisbind, trec, tstats) = stats(newstats, self = Some(selfopt))
-      val (n, Attr(id, _, _)) = thisbind.get
+      val (thisbind, tstats) = stats(newstats, self = Some(selfopt))
+      val (n, Attr(id, trec: Type.Rec, _)) = thisbind.get
       New(Some(Name(n, lex = Lex(id = id))), tstats, tpe = Some(trec))
 
     case Select(obj, name: Name, _) =>
@@ -462,12 +462,8 @@ object attribute {
     UnquoteTypecheck.term(term)
   }
 
-  def typ(tree: Type)(implicit env: Env = Env()): Type = tree match {
-    case builtin: Type.Builtin    => builtin
-    case Type.Func(from, to)      => Type.Func(typ(from), typ(to))
-    // TODO: validate that there no repetion a-la { val x: {} val x: {} }
-    case Type.Rec(fields)         => Type.Rec(fields.map { case (n, t) => (n, typ(t)) })
-  }
+  // TODO: validate that there no repetion a-la { val x: {} val x: {} }
+  def typ(tree: Type)(implicit env: Env = Env()): Type = tree
 }
 
 object expand {
@@ -520,7 +516,7 @@ object expand {
           val tprefix =
             if (prefix.tpe.nonEmpty) prefix
             else attribute.term(prefix)(lenv)
-          Select(prefix, Name(n))
+          Select(term(tprefix), Name(n))
       }.getOrElse {
         abort(s"panic, can't resolve $n (${env})")
       }
@@ -643,8 +639,6 @@ object predefined {
   )
 
   val attrs = entries.map { case (n, (t, _)) => n -> Attr(id = attribute.freshId, tpe = t, prefix = None) }.toMap
-  //val renames    = entries.map { case (n, _) => n -> expand.rename(Name(n)) }.toMap
-  //val transforms = renames.map { case (n, (_, tx)) => n -> tx }
   val funcvalues = entries.zip(attrs).map { case ((n, (_, v)), (_, attr)) => attr.id -> v }.toMap
 }
 
@@ -820,13 +814,14 @@ object eval {
 
 object Test extends App {
   val parsed = parse("""new { root =>
-    val x: Int = 0;
-    macro m(): Int => Int = `f';
-    val res: Int = {
-      val f: Int => Int = (x: Int) => x;
-      val z: Int => Int = m;
-      z 1
-    }
+    val X: { x: Int } = new { val x: Int = 2 };
+    import X._;
+    macro m(): Int = {
+      val fx: Term = `f x';
+      val block: Term = `{ val f: Int => Int = add 1; $fx }';
+      block
+    };
+    m
   }""")
   println(parsed.map { t => s"parsed:\n$t\n" }.getOrElse(parsed.toString))
 
