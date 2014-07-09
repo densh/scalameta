@@ -598,25 +598,25 @@ object Value {
   }
 
   implicit val bool2value: Convert[scala.Boolean, Value.Stack] = Convert(Value.Bool.apply)
-  implicit val int2value: Convert[scala.Int, Value.Stack] = Convert(Value.Int.apply)
+  implicit val int2value:  Convert[scala.Int, Value.Stack]     = Convert(Value.Int.apply)
   implicit val value2bool: Extract[Value.Stack, scala.Boolean] = Extract { case Value.Bool(b) => b }
-  implicit val value2int: Extract[Value.Stack, scala.Int] = Extract { case Value.Int(v) => v }
+  implicit val value2int:  Extract[Value.Stack, scala.Int]     = Extract { case Value.Int(v) => v }
 }
 
 object predefined {
   import eval.Res
 
   def binop[A, B, R](f: (A, B) => R)(implicit A: Type.Tag[A], B: Type.Tag[B], R: Type.Tag[R],
-                                              EA: Extract[Value.Stack, A], EB: Extract[Value.Stack, B],
-                                              CR: Convert[R, Value.Stack]): (Type, Value.Func) =
+                                              ToA: Extract[Value.Stack, A], ToB: Extract[Value.Stack, B],
+                                              fromR: Convert[R, Value.Stack]): (Type, Value.Func) =
     Type.Func(A.tpe, Type.Func(B.tpe, R.tpe)) ->
-      Value.Func { case Res(EA(a), s1) =>
-        s1.alloc(Value.Func { case Res(EB(b), s2) => Res(CR(f(a, b)), s2) })
+      Value.Func { case Res(ToA(a), s1) =>
+        s1.alloc(Value.Func { case Res(ToB(b), s2) => Res(fromR(f(a, b)), s2) })
       }
 
   def unop[A, R](f: A => R)(implicit A: Type.Tag[A], R: Type.Tag[R],
-                                     EA: Extract[Value.Stack, A], CR: Convert[R, Value.Stack]): (Type, Value.Func) =
-    Type.Func(A.tpe, R.tpe) -> Value.Func { case Res(EA(a), s) => Res(CR(f(a)), s) }
+                                     ToA: Extract[Value.Stack, A], fromR: Convert[R, Value.Stack]): (Type, Value.Func) =
+    Type.Func(A.tpe, R.tpe) -> Value.Func { case Res(ToA(a), s) => Res(fromR(f(a)), s) }
 
   val entries = List(
     "add" -> binop { (a: Int, b: Int) => a + b },
