@@ -4,6 +4,8 @@ import org.scalameta.show.Show, Show.{ sequence => s, repeat => r, indent => i, 
 import scala.util.parsing.combinator.syntactical.StandardTokenParsers
 import scala.util.parsing.input.CharSequenceReader
 import scala.language.higherKinds
+import Tree._, Stmt._, Term._
+import util._
 
 object util {
   def abort(msg: String): Nothing = throw new Exception(msg)
@@ -42,13 +44,48 @@ object util {
     if (i < 0) "₋" + subscripted(-i)
     else if (i >= 10) subscripted(i/10) + subscripted(i%10)
     else num2subs(i)
+
+  type Env = List[Rename]
+  def Env() = predefined.renames
 }
-import util._
+
+final case class Rename(from: Name, to: Name)
+final case class Lex(renames: List[Rename] = Nil, marks: Set[Int] = Set.empty) {
+  def ++(other: Iterable[Rename]) = Lex(renames ++ other, marks)
+  def +(rename: Rename) = Lex(renames :+ rename, marks)
+}
+object Lex {
+  implicit val show: Show[Lex] = Show { lex =>
+    s(lex.marks.toList.map(superscripted).mkString("", "⁺", ""))
+  }
+}
 
 sealed trait Tree { override def toString = Tree.show(this).toString }
 object Tree {
-  case class Name(value: String, lex: Lex = Lex.empty) extends Tree
-  object Name { implicit val show: Show[Name] = Show { n => s(n.value, n.lex) } }
+  case class Name(value: String, id: Int = 0, lex: Lex = Lex(),
+                  atpe: Option[Type] = None, prefix: Option[Term] = None) extends Term {
+    def resolve: Name = lex match {
+      case Lex(Nil, marks) =>
+        this
+      case Lex(Rename(from, to) :: rest, marks) =>
+        val rfrom = from.resolve
+        val rrest = Name(value, id, Lex(rest, marks)).resolve
+        println(s"rfrom: $rfrom (${rfrom.lex.marks}), rrest: $rrest ($marks)")
+        if (rfrom.value     == rrest.value &&
+            rfrom.id        == rrest.id    &&
+            rfrom.lex.marks == marks       )
+          to
+        else
+          rrest
+    }
+    def tpe = resolve.atpe
+  }
+  object Name {
+    implicit val show: Show[Name] = Show { n =>
+      val r = n.resolve
+      s(r.value, if (r.id != 0) s(subscripted(r.id)) else s(), r.lex)
+    }
+  }
 
   case class Param(name: Name, typ: Type) extends Tree
   object Param { implicit val show: Show[Param] = Show { p => s(p.name, ": ", p.typ) } }
@@ -106,7 +143,6 @@ object Tree {
     case class New(self: Option[Name], stats: List[Stmt], tpe: Option[Type.Rec] = None) extends Term
     case class Apply(fun: Term, arg: Term, tpe: Option[Type] = None) extends Term
     case class Select(prefix: Term, name: Name, tpe: Option[Type] = None) extends Term
-    case class Ident(name: Name, tpe: Option[Type] = None) extends Term
     case class If(cond: Term, thenp: Term, elsep: Term, tpe: Option[Type] = None) extends Term
     case class Quote(term: Term) extends Pretyped { val tpe = Some(Type.Term) }
     case class Unquote(term: Term) extends Pretyped { val tpe = None }
@@ -114,7 +150,7 @@ object Tree {
     case object True extends Pretyped { val tpe = Some(Type.Bool) }
     case object False extends Pretyped { val tpe = Some(Type.Bool) }
     case object Unit extends Pretyped { val tpe = Some(Type.Unit) }
-    case class Captured(term: Term, env: attribute.Env) extends Term { def tpe = term.tpe }
+    case class Captured(term: Term, env: Env) extends Term { def tpe = term.tpe }
 
     implicit val show: Show[Term] = Show { t =>
       val raw = t match {
@@ -128,10 +164,10 @@ object Tree {
                                             if (stats.nonEmpty) n("}") else s("}"))
         case Apply(f, arg, _)          => s(f, "(", arg, ")")
         case Select(pre, name, _)      => s(pre, ".", name)
-        case Ident(name, _)            => s(name)
+        case name: Name                => s(name)
         case If(cond, thenp, elsep, _) => s("if ", cond, " then ", thenp, " else ", elsep)
-        case Quote(t)                  => s("`", (t: Term), "'")
-        case Unquote(id: Ident)        => s("$", (id: Term))
+        case Quote(t)                  => s("`", t, "'")
+        case Unquote(n: Name)          => s("$", n)
         case Unquote(term)             => s("${", term, "}")
         case True                      => s("true")
         case False                     => s("false")
@@ -147,18 +183,11 @@ object Tree {
   implicit val show: Show[Tree] = Show {
     case t: Type  => s(t)
     case t: Stmt  => s(t)
-    case t: Name  => s(t)
     case t: Param => s(t)
   }
 }
-import Tree._, Stmt._, Term._
 
-final case class Attr(id: Int, tpe: Type, prefix: Option[Term])
-final case class Lex(env: Map[String, Attr] = Map.empty, id: Int = 0)
-object Lex {
-  val empty = Lex()
-  implicit val show: Show[Lex] = Show { lex => if (lex.id != 0) s(subscripted(lex.id)) else s() }
-}
+
 
 trait Convert[From, To] { def apply(from: From): To }
 object Convert {
@@ -178,7 +207,6 @@ object parse extends StandardTokenParsers {
                               "Unit", "Any", "true", "false", "if", "then", "else")
 
   def name:    Parser[Name]    = ident                 ^^ { Name(_) }
-  def id:      Parser[Ident]   = name                  ^^ { Ident(_) }
   def num:     Parser[Term]    = opt("-") ~ numericLit ^^ { case m ~ s => Integer(s.toInt * m.map(_ => -1).getOrElse(1)) }
   def bool:    Parser[Term]    = ("true"  ^^^ True |
                                  "false" ^^^ False)
@@ -194,7 +222,7 @@ object parse extends StandardTokenParsers {
   }
   def parens(d: Int):  Parser[Term]    = "(" ~> opt(term(d)) <~ ")"        ^^ { _.getOrElse(Term.Unit) }
   def quote(d: Int):   Parser[Quote]   = "`" ~> term(d = d + 1) <~ "'"     ^^ { t => Quote(t) }
-  def unquote(d: Int): Parser[Unquote] = ("$" ~> id                        ^^ { Unquote(_) } |
+  def unquote(d: Int): Parser[Unquote] = ("$" ~> name                      ^^ { Unquote(_) } |
                                           "$" ~> "{" ~> term(d - 1) <~ "}" ^^ { Unquote(_) } )
 
 
@@ -202,7 +230,7 @@ object parse extends StandardTokenParsers {
     case cond ~ thenp ~ elsep => If(cond, thenp, elsep)
   }
   def term1(d: Int):  Parser[Term]  = {
-    val always = `if`(d) | bool | id | block(d) | `new`(d) | func(d) | parens(d) | quote(d) | num
+    val always = `if`(d) | bool | name | block(d) | `new`(d) | func(d) | parens(d) | quote(d) | num
     if (d > 0) always | unquote(d) else always
   }
   def term2(d: Int):  Parser[Term]  = term1(d) ~ opt("." ~> name) ^^ { case x ~ y => (x /: y)(Select(_, _)) }
@@ -247,9 +275,10 @@ abstract class Transform {
     case Macro(n, params, t, body) :: rest => Macro(name(n), params.map(param), typ(t), term(body)) :: stats(rest)
   }
   def term(t: Term): Term = t match {
-    case True | False | Unit         |
-         (_: Ident)   | (_: Quote)   |
-         (_: Unquote) | (_: Integer) => t
+    case True | False | Unit | (_: Integer) => t
+    case Quote(term)                 => term
+    case Unquote(term)               => term
+    case n: Name                     => name(n)
     case Apply(f, x, tpe)            => Apply(term(f), term(x), tpe.map(typ))
     case Ascribe(t, tpt, tpe)        => Ascribe(term(t), typ(tpt), tpe.map(typ))
     case Block(xs, tpe)              => Block(stats(xs), tpe.map(typ))
@@ -297,85 +326,89 @@ object semantic {
 }
 import semantic._
 
+
 object attribute {
-  type Env = Map[String, Attr]
-  def Env(): Env = predefined.attrs
-
-  def imp(from: Term)(implicit env: Env = Env()): Map[String, Type] = from.tpe.get match {
-    case Type.Rec(members) => members
-    case _                 => Map.empty
-  }
-
   var lastId = 0
   def freshId: Int = {
     lastId += 1
     lastId
   }
 
+  def imp(from: Term)(implicit env: Env = Env()): Map[String, Type] = from.tpe.get match {
+    case Type.Rec(members) => members
+    case _                 => Map.empty
+  }
+
   // TODO: fail on forward references in blocks
-  def stats(ss: List[Stmt], self: Option[Option[Name]] = None)(implicit env: Env = Env()): (Option[(String, Attr)], List[Stmt]) = {
+  def stats(ss: List[Stmt], self: Option[Option[Name]] = None)(implicit env: Env = Env()): (Option[Rename], List[Stmt]) = {
     val thisv: Option[String] = self.map { _.map(_.value).getOrElse("this") }
     val thisid   = freshId
 
-    val valscope: Env = ss.collect {
+    val valscope = ss.collect {
       case Val(n, t, _) =>
-        n.value -> Attr(id = freshId, tpe = t,
-                        prefix = thisv.map(v => Ident(Name(v, Lex(id = thisid)))))
-    }.toMap
-    val macroscope: Env = ss.collect {
+        Rename(from = n, to = Name(n.value, id = freshId, atpe = Some(t),
+               prefix = thisv.map(v => Name(v, id = thisid))))
+    }
+    val macroscope = ss.collect {
       case Macro(n, params, t, _) =>
         val mt = params.map(_.typ).foldRight(t) { Type.Func(_, _) }
-        n.value -> Attr(id = freshId, tpe = mt, prefix = None)
-    }.toMap
+        Rename(from = n, to = Name(n.value, id = freshId, atpe = Some(mt), prefix = None))
+    }
 
-    val thistype = Type.Rec(valscope.map { case (n, attr) => n -> attr.tpe })
-    val thisbind =
+    val thisattr =
       thisv.map { v =>
-        v -> Attr(id = thisid, tpe = thistype, prefix = None)
+        Rename(from = Name(v),
+               to = Name(v, id = thisid,
+                         atpe = Some(Type.Rec(valscope.map { rn => rn.to.value -> rn.to.tpe.get }.toMap)),
+                         prefix = None))
       }
 
-    val scope: Env = valscope ++ macroscope ++ thisbind
+    val scope: List[Rename] = valscope ++ macroscope ++ thisattr
 
     def loop(ss: List[Stmt])(implicit env: Env): List[Stmt] = ss match {
       case Nil => Nil
-      case Val(Name(n, _), tpt, body) :: rest =>
+      case Val(n, tpt, body) :: rest =>
         val ttpt = typ(tpt)
         val tbody = term(body)
-        if (tbody.tpe.get `<:` ttpt) Val(Name(n, Lex(id = env(n).id)), ttpt, tbody) :: loop(rest)
+        val tn = n.copy(lex = n.lex ++ env)
+        if (tbody.tpe.get `<:` ttpt) Val(tn, ttpt, tbody) :: loop(rest)
         else abort(s"body type ${tbody.tpe.get} isn't a subtype of ascribed type $ttpt")
-      case Macro(Name(n, _), params, t, b) :: rest =>
-        val attrparams = params.map { case Param(Name(pn, _), t) =>
+      case Macro(n, params, t, b) :: rest =>
+        val renameparams = params.map { case Param(pn, t) =>
           val pid = freshId
-          val p = Param(Name(pn, Lex(id = pid)), t)
-          val attr = Attr(id = pid, tpe = Type.Term, prefix = None)
-          (attr, p)
+          val rn = Rename(from = pn, to = Name(pn.value, id = pid, atpe = Some(Type.Term), prefix = None))
+          val p = Param(pn.copy(lex = pn.lex + rn), t)
+          (rn, p)
         }
-        val tparams = attrparams.map { case (_, p) => p }
-        val envupd = attrparams.map { case (attr, p) => p.name.value -> attr }
-        Macro(Name(n, Lex(id = env(n).id)), tparams, t, term(b)(env ++ envupd)) :: loop(rest)
+        val tn = n.copy(lex = n.lex ++ env)
+        val tparams = renameparams.map { case (_, p) => p }
+        val envupd = renameparams.map { case (rn, _) => rn }
+        Macro(tn, tparams, t, term(b)(env ++ envupd)) :: loop(rest)
       case Import(from) :: rest =>
         val tfrom = term(from)
-        val binds = imp(tfrom).toList.map { case (s, t) => s -> Attr(id = freshId, tpe = t, prefix = Some(tfrom)) }
+        val binds = imp(tfrom).toList.map { case (s, t) =>
+          Rename(from = Name(s), to = Name(s, atpe = Some(t), prefix = Some(tfrom)))
+        }
         Import(tfrom) :: loop(rest)(env ++ binds)
       case (t: Term) :: rest =>
         term(t) :: loop(rest)
     }
 
-    (thisbind, loop(ss)(env ++ scope))
+    (thisattr, loop(ss)(env ++ scope))
   }
 
   def term(tree: Term)(implicit env: Env = Env()): Term = tree match {
-    case Ident(Name(n, _), _) =>
-      if (!env.contains(n)) abort(s"$n is not in scope")
-      else Ident(Name(n, lex = Lex(env = env)), tpe = Some(env(n).tpe))
+    case n: Name =>
+      n.copy(lex = n.lex ++ env)
 
     case Func(param, body, _) =>
-      val (tparam, ttpt, tbody) = param.map { case Param(Name(x, _), tpt) =>
+      val (tparam, ttpt, tbody) = param.map { case Param(x, tpt) =>
         val ttpt = typ(tpt)
         val pid = freshId
-        val pattr = Attr(id = pid, tpe = ttpt, prefix = None)
-        val tbody = term(body)(env + (x -> pattr))
-        (Some(Param(Name(x, Lex(id = pid)), ttpt)), ttpt, tbody)
+        val rn = Rename(from = x, to = Name(x.value, id = pid, atpe = Some(ttpt), prefix = None))
+        val tx = x.copy(lex = x.lex + rn)
+        val tbody = term(body)(env :+ rn)
+        (Some(Param(tx, ttpt)), ttpt, tbody)
       }.getOrElse {
         val tbody = term(body)
         (None, Type.Unit, tbody)
@@ -385,14 +418,16 @@ object attribute {
     case Apply(f, arg, _) =>
       val tf = term(f)
       val targ = term(arg)
-      tf.tpe.get match {
-        case tpe @ Type.Func(from, to) =>
+      tf.tpe match {
+        case Some(tpe @ Type.Func(from, to)) =>
           if (targ.tpe.get `<:` from)
             Apply(tf, targ, tpe = Some(to))
           else
             abort(s"function expected $from but got ${targ.tpe.get} ($tf $targ)")
-        case t =>
+        case Some(t) =>
           abort(s"one can only apply to function values, not $t")
+        case None =>
+          abort(s"OOPSIE, $tf")
       }
 
     case Block(blockstats, _) =>
@@ -403,9 +438,9 @@ object attribute {
       })
 
     case New(selfopt, newstats, _) =>
-      val (thisbind, tstats) = stats(newstats, self = Some(selfopt))
-      val (n, Attr(id, trec: Type.Rec, _)) = thisbind.get
-      New(Some(Name(n, lex = Lex(id = id))), tstats, tpe = Some(trec))
+      val (thisrn, tstats) = stats(newstats, self = Some(selfopt))
+      val Some(Rename(_, to @ Name(_, _, _, Some(trec: Type.Rec), _))) = thisrn
+      New(Some(to), tstats, Some(trec))
 
     case Select(obj, name: Name, _) =>
       val tobj = term(obj)
@@ -467,11 +502,33 @@ object attribute {
 }
 
 object expand {
-  final case class Tx(arity: Int, f: (attribute.Env, List[Term]) => Term)
-  type Env = Map[String, Tx]
-  def Env(): Env = Map.empty
+  final case class Tx(arity: Int, f: (Env, List[Term]) => Term)
+  type TEnv = Map[String, Tx]
+  def TEnv(): TEnv = Map.empty
 
-  def stats(trees: List[Stmt], self: Option[(Option[Name], Type.Rec)] = None)(implicit env: Env = Env()): List[Stmt] = trees match {
+  var lastMark = 0
+  def freshMark: Int = {
+    lastMark += 1
+    lastMark
+  }
+
+  def mark(term: Term, markId: Int): Term = {
+    object Mark extends Transform {
+      override def name(n: Name): Name = {
+        val marked = n.copy(lex = n.lex.copy(marks = {
+        if (n.lex.marks.contains(markId))
+          n.lex.marks - markId
+        else
+          n.lex.marks + markId
+        }))
+        println(s"marked $n as $marked")
+        marked
+      }
+    }
+    Mark.term(term)
+  }
+
+  def stats(trees: List[Stmt], self: Option[(Option[Name], Type.Rec)] = None)(implicit env: TEnv = TEnv()): List[Stmt] = trees match {
     case Nil => Nil
     case (t: Term) :: rest =>
       term(t) :: this.stats(rest)
@@ -482,10 +539,16 @@ object expand {
     case Macro(n, params, t, body) :: rest =>
       val rbody = term(body)
       val tx = Tx(params.length, { (appenv, args) =>
-        val pre = params.zip(args).map { case (p, arg) => Val(p.name, Type.Term, Quote(arg)) }
+        val m = freshMark
+        val margs = args.map(mark(_, m))
+        val pre = params.zip(margs).map { case (p, marg) => Val(p.name.resolve, Type.Term, Quote(marg)) }
         val eval.Res(ptr: Value.Ptr, store) = eval.term(Term.Block(pre :+ rbody))
         val Value.Tree(exp) = store(ptr.id)
-        val texp = attribute.term(exp)(appenv)
+        println(s"original expansion: $exp")
+        val uexp = mark(exp, m)
+        println(s"remarked expansion: $uexp")
+        val texp = attribute.term(uexp)(appenv)
+        println(s"attributed expansion: $texp")
         if (!(texp.tpe.get `<:` t)) abort(s"macro expansion type ${texp.tpe.get} doesn't conform to $t")
         val rexp = expand.term(texp)
         rexp
@@ -500,25 +563,24 @@ object expand {
     }
   }
 
-  def term(tree: Term)(implicit env: Env = Env()): Term = tree match {
-    case Applied(Ident(Name(n, Lex(lenv, _)), _), args) if env.contains(n) =>
-      val Tx(arity, f) = env.get(n).get
+  def term(tree: Term)(implicit env: TEnv = TEnv()): Term = tree match {
+    case Applied(n: Name, args) if env.contains(n.value) =>
+      val Tx(arity, f) = env.get(n.value).get
       if (args.length != arity)
         abort(s"macro $n expected $arity arguments, got ${args.length}")
-      f(lenv, args.map(arg => term(arg)))
-    case Ident(Name(_, Lex(_, id)), _) if id != 0 =>
-      tree
-    case Ident(Name(n, Lex(lenv, id)), tpe) =>
-      lenv.get(n).map {
-        case Attr(it, _, None) =>
-          Ident(Name(n, Lex(id = lenv(n).id)), tpe)
-        case Attr(it, _, Some(prefix)) =>
+      f(n.lex.renames, args)
+    case n: Name if n.id != 0 =>
+      n
+    case n: Name =>
+      n.resolve match {
+        case rn @ Name(_, id, _, _, None) =>
+          require(id != 0, "renamed to id with zero id and no prefix: $rn")
+          rn
+        case rn @ Name(_, _, lex, tpe, Some(prefix)) =>
           val tprefix =
             if (prefix.tpe.nonEmpty) prefix
-            else attribute.term(prefix)(lenv)
-          Select(term(tprefix), Name(n))
-      }.getOrElse {
-        abort(s"panic, can't resolve $n (${env})")
+            else attribute.term(prefix)(lex.renames)
+          Select(term(tprefix), n.copy(prefix = None, atpe = None), tpe = tpe)
       }
     case Apply(fun, arg, tpe) =>
       Apply(term(fun), term(arg), tpe)
@@ -543,7 +605,7 @@ object expand {
     case _: Pretyped => tree
   }
 
-  def quote(q: Quote)(implicit env: Env = Env()): Quote = {
+  def quote(q: Quote)(implicit env: TEnv = TEnv()): Quote = {
     object ExpandUnquote extends Transform {
       override def term(t: Term): Term = t match {
         case Unquote(term) => Unquote(expand.term(term))
@@ -638,12 +700,14 @@ object predefined {
     "lte" -> binop { (a: Int, b: Int) => a <= b }
   )
 
-  val attrs = entries.map { case (n, (t, _)) => n -> Attr(id = attribute.freshId, tpe = t, prefix = None) }.toMap
-  val funcvalues = entries.zip(attrs).map { case ((n, (_, v)), (_, attr)) => attr.id -> v }.toMap
+  val renames = entries.map { case (n, (t, _)) =>
+    Rename(from = Name(n), to = Name(n, id = attribute.freshId, atpe = Some(t), prefix = None))
+  }
+  val funcvalues = entries.zip(renames).map { case ((n, (_, v)), rn) => rn.to.id -> v }.toMap
 }
 
 object eval {
-  def abort(msg: String)(implicit env: Env) = uscala.util.abort(s"$msg (${env.store})")
+  def abort(msg: String)(implicit env: REnv) = uscala.util.abort(s"$msg (${env.store})")
 
   final case class Store(objs: Map[Int, Value.Ref] = Map.empty, newid: Int = 1) {
     def alloc(v: Value.Ref): Res = {
@@ -663,25 +727,25 @@ object eval {
       put(id, f(v))
     }
   }
-  final case class Env(stack: List[Map[Int, Value.Stack]], store: Store) {
+  final case class REnv(stack: List[Map[Int, Value.Stack]], store: Store) {
     require(stack.nonEmpty)
 
-    def bind(name: Name, value: Value.Stack): Env = {
-      assert(name.lex.id != 0, s"name id can't be 0 (name = $name)")
+    def bind(name: Name, value: Value.Stack): REnv = {
+      assert(name.id != 0, s"name id can't be 0 (name = $name)")
       val head :: tail = stack
-      Env((head + (name.lex.id -> value)) :: tail, store)
+      REnv((head + (name.id -> value)) :: tail, store)
     }
-    def bind(bindings: List[(Name, Value.Stack)]): Env = {
+    def bind(bindings: List[(Name, Value.Stack)]): REnv = {
       var env = this
       bindings.foreach { case (n, v) => env = env.bind(n, v) }
       env
     }
-    def push(): Env =
-      Env(Map.empty[Int, Value.Stack] :: stack, store)
+    def push(): REnv =
+      REnv(Map.empty[Int, Value.Stack] :: stack, store)
     def lookup(n: Name): Value.Stack =
-      stack.collectFirst { case m if m.contains(n.lex.id) => m(n.lex.id) }.getOrElse(abort(s"couldn't lookup $n")(this))
+      stack.collectFirst { case m if m.contains(n.id) => m(n.id) }.getOrElse(abort(s"couldn't lookup $n")(this))
   }
-  object Env {
+  object REnv {
     def default = {
       var store = Store()
       var stack = Map.empty[Int, Value.Stack]
@@ -690,7 +754,7 @@ object eval {
         store = newstore
         stack = stack + (id -> ref)
       }
-      Env(stack :: Nil, store)
+      REnv(stack :: Nil, store)
     }
   }
   final case class Res(value: Value.Stack, store: Store) {
@@ -708,7 +772,7 @@ object eval {
     case Type.Nothing    => unreachable
   }
 
-  def stats(stats: List[Stmt], self: Option[Name] = None)(implicit env: Env = Env.default): Res = {
+  def stats(stats: List[Stmt], self: Option[Name] = None)(implicit env: REnv = REnv.default): Res = {
     val (nenv, selfrefopt) = self.map { n =>
       val Res(ref: Value.Ptr, s) = env.store.alloc(Value.Obj(stats.collect {
         case Val(n, tpt, _) => n.value -> this.default(tpt)
@@ -716,7 +780,7 @@ object eval {
       (env.bind(n, ref).copy(store = s), Some(ref))
     }.getOrElse((env, None))
 
-    def loop(stats: List[Stmt])(implicit env: Env): Res = stats match {
+    def loop(stats: List[Stmt])(implicit env: REnv): Res = stats match {
       case Nil =>
         Res(Value.Unit, env.store)
       case v @ Val(name, tpt, body) :: rest =>
@@ -745,7 +809,7 @@ object eval {
     }.getOrElse(res)
   }
 
-  def term(t: Term)(implicit env: Env = Env.default): Res = t match {
+  def term(t: Term)(implicit env: REnv = REnv.default): Res = t match {
     case Apply(fun, value, _) =>
       val Res(efun, s1) = eval.term(fun)
       val Res(evalue, s2) = eval.term(value)(env.copy(store = s1))
@@ -767,7 +831,7 @@ object eval {
         case other =>
           unreachable
       }
-    case Ident(name, _) =>
+    case name: Name =>
       Res(env.lookup(name), env.store)
     case Block(stats, _) =>
       eval.stats(stats)
@@ -794,7 +858,7 @@ object eval {
     case Unit                       => Res(Value.Unit, env.store)
   }
 
-  def quote(q: Quote)(implicit env: Env = Env.default): Res = {
+  def quote(q: Quote)(implicit env: REnv = REnv.default): Res = {
     object UnquoteSubs extends Transform {
       var store = env.store
       override def term(t: Term): Term = t match {
@@ -813,16 +877,14 @@ object eval {
 }
 
 object Test extends App {
-  val parsed = parse("""new { root =>
-    val X: { x: Int } = new { val x: Int = 2 };
-    import X._;
-    macro m(): Int = {
-      val fx: Term = `f x';
-      val block: Term = `{ val f: Int => Int = add 1; $fx }';
-      block
-    };
-    m
-  }""")
+  val parsed = parse("""
+
+    (x: Int) => {
+      macro n(e: Int): Int => Int = `(x: Int) => add $e x';
+      n x
+    }
+
+  """)
   println(parsed.map { t => s"parsed:\n$t\n" }.getOrElse(parsed.toString))
 
   val attributed = attribute.term(parsed.get)
