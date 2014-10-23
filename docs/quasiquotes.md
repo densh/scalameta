@@ -39,7 +39,7 @@
  Match             | `q"$expr match { ..case $pat if $cond => ..$stat }"`
  Try Catch Cases   | `q"try $expr catch $expr finally $expr"`
  Try Catch Expr    | `q"try $expr catch { ..case $pat if $cond => ..$stat } finally $expr" `
- Function          | `q"(..$iparams) => $expr"`
+ Function          | `q"(..$params) => $expr"`
  Partial Function  | `q"{ ..case $pat if $cond => ..$stat }"`
  While             | `q"while ($expr) $expr"`
  Do While          | `q"do $expr while($expr)"`
@@ -143,19 +143,21 @@
  Package Object | `q"package object $name extends $template"`
  Package        | `q"package $ref { ..$stats }"`
 
-### Params
+### Parameters
 
-                | Quasiquote
-----------------|-------------------------------------------------
- Term Param     | `param"..$mods $nameopt: $atpeopt = $defaultopt"`
- Template Param | `param"..$mods $name: $atpe = $defaultopt"`, `param"..$mods val $name: $atpe = $defaultopt"`, `param"..$mods var $name: $atpe = $defaultopt"`
- Type Param     | `param"..$mods type $nameopt[..$tparams] <% ..$tpes : ..$tpes >: $tpeopt <: $tpeopt"`
+                    | Quasiquote
+--------------------|-------------------------------------------------
+ Term Parameter     | `param"..$mods $nameopt: $atpeopt = $defaultopt"`
+ Template Parameter | `param"..$mods $name: $atpe = $defaultopt"`
+                      `param"..$mods val $name: $atpe = $defaultopt"`
+                      `param"..$mods var $name: $atpe = $defaultopt"`
+ Type Paramater     | `param"..$mods type $nameopt[..$tparams] <% ..$tpes : ..$tpes >: $tpeopt <: $tpeopt"`
 
 ## Template (meta.Template) and Parents (meta.Parent)
 
            | Quasiquote
 -----------|--------------------
- Template  | `templ"{ ..$stat } with ..$parents { $iparam => ..$stats }"`
+ Template  | `templ"{ ..$stat } with ..$parents { $param => ..$stats }"`
  Parent    | `templ"$tpe(...$argss)"`
 
 ## Modifiers (meta.Mod)
