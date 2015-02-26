@@ -158,6 +158,20 @@ object build extends Build {
     scalaSource in Compile <<= (baseDirectory in Compile)(base => base)
   ) dependsOn (scalameta)
 
+  lazy val benchmarks = Project(
+    id   = "benchmarks",
+    base = file("benchmarks")
+  ) settings (
+    sharedSettings: _*
+  ) settings (
+    libraryDependencies += "com.storm-enroute" %% "scalameter" % "0.6",
+    libraryDependencies <+= (scalaVersion)("org.scala-lang" % "scala-compiler" % _ % "provided"),
+    testFrameworks += new TestFramework("org.scalameter.ScalaMeterFramework"),
+    parallelExecution in Test := false
+  ) settings (
+    scalaSource in Compile <<= (baseDirectory in Compile)(base => base)
+  ) dependsOn (scalameta)
+
   lazy val tests = Project(
     id   = "tests",
     base = file("tests")
